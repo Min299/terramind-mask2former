@@ -8,6 +8,9 @@ Converts list of samples into batches with proper target format.
 import torch
 
 
+IGNORE_INDEX = 255
+
+
 def multitask_collate_fn(batch):
     """
     Collate function for multi-task Mask2Former training.
@@ -44,15 +47,14 @@ def multitask_collate_fn(batch):
         # Convert semantic mask to Mask2Former target format
         mask = sample["mask"]
         
-        # Handle tensor vs numpy
-        if isinstance(mask, torch.Tensor):
-            mask = mask.cpu().numpy()
+        # Keep as tensor, just ensure long type
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.as_tensor(mask)
+        mask = mask.long()
         
-        mask = torch.from_numpy(mask).long().to("cpu")
-        
-        # Get unique classes (excluding ignore_index=255)
+        # Get unique classes (excluding ignore_index)
         classes = torch.unique(mask)
-        classes = classes[classes != 255]
+        classes = classes[classes != IGNORE_INDEX]
         
         gt_masks = []
         gt_classes = []
