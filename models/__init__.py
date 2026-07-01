@@ -5,6 +5,7 @@ from .layers import ConvNormAct, ProjectionBlock, UpsampleBlock, DownsampleBlock
 from .ms_deform_attn import MSDeformAttn, MSDeformAttnTransformerEncoderOnly
 from .pixel_decoder import MSDeformAttnPixelDecoder
 from .transformer_decoder import MultiScaleMaskedTransformerDecoder
+from .multitask_model import MultiTaskMask2Former
 
 __all__ = [
     "TerraMindEncoder",
@@ -18,4 +19,5 @@ __all__ = [
     "MSDeformAttnTransformerEncoderOnly",
     "MSDeformAttnPixelDecoder",
     "MultiScaleMaskedTransformerDecoder",
+    "MultiTaskMask2Former",
 ]
