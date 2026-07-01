@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .point_features import point_sample, get_uncertain_point_coords_with_randomness, calculate_uncertainty
+
 
 def dice_loss(
     inputs: torch.Tensor,
@@ -49,108 +51,6 @@ def sigmoid_ce_loss(
     """
     loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
     return loss.mean(1).sum() / num_masks
-
-
-def calculate_uncertainty(logits):
-    """
-    We estimate uncertainty as L1 distance between 0.0 and the logit prediction 
-    for the foreground class.
-    
-    Args:
-        logits: A tensor of shape (R, 1, ...) containing logits.
-    
-    Returns:
-        scores: A tensor of shape (R, 1, ...) containing uncertainty scores with
-            the most uncertain locations having the highest uncertainty score.
-    """
-    assert logits.shape[1] == 1
-    return -(torch.abs(logits))
-
-
-def get_uncertain_point_coords_with_randomness(
-    logits,
-    uncertainty_func,
-    num_points,
-    oversample_ratio=3.0,
-    importance_sample_ratio=0.75,
-):
-    """
-    Sample points based on uncertainty.
-    
-    Args:
-        logits: Input logits
-        uncertainty_func: Function to compute uncertainty
-        num_points: Number of points to sample
-        oversample_ratio: Oversampling ratio
-        importance_sample_ratio: Ratio of importance samples
-    
-    Returns:
-        Point coordinates
-    """
-    assert num_points > 0
-    
-    num_boxes = logits.shape[0]
-    num_sampled = int(num_points * oversample_ratio)
-    
-    # Get random point coordinates
-    point_coords = torch.rand(num_boxes, num_sampled, 2, device=logits.device)
-    
-    # Get uncertainty scores
-    with torch.no_grad():
-        uncertainties = uncertainty_func(logits)
-    
-    # Select most uncertain points
-    num_uncertain_points = int(num_points * importance_sample_ratio)
-    num_random_points = num_points - num_uncertain_points
-    
-    if num_uncertain_points > 0:
-        _, top_indices = uncertainties.squeeze(1).topk(num_uncertain_points, dim=1)
-        uncertain_coords = torch.gather(
-            point_coords, 1, top_indices.unsqueeze(-1).expand(-1, -1, 2)
-        )
-    else:
-        uncertain_coords = None
-    
-    # Add random points
-    random_indices = torch.randperm(num_sampled)[:num_random_points]
-    random_coords = point_coords[:, random_indices, :]
-    
-    if uncertain_coords is not None:
-        point_coords = torch.cat([uncertain_coords, random_coords], dim=1)
-    else:
-        point_coords = random_coords
-    
-    return point_coords
-
-
-def point_sample(input_features, point_coords, align_corners=False):
-    """
-    Sample features at point coordinates.
-    
-    Args:
-        input_features: Feature tensor [B, C, H, W]
-        point_coords: Point coordinates [B, N, 2] in range [-1, 1]
-        align_corners: Whether to align corners
-    
-    Returns:
-        Sampled features [B, C, N]
-    """
-    B, C, H, W = input_features.shape
-    N = point_coords.shape[1]
-    
-    # Reshape point coordinates for grid_sample
-    point_coords = point_coords.reshape(B, N, 1, 2)
-    
-    # Sample using grid_sample: [B, C, 1, N]
-    sampled = F.grid_sample(
-        input_features, 
-        point_coords, 
-        align_corners=align_corners, 
-        mode='bilinear'
-    )
-    
-    # Reshape to [B, C, N]
-    return sampled.reshape(B, C, N)
 
 
 class SetCriterion(nn.Module):
