@@ -1,29 +1,5 @@
 """
-LoveDA Dataset Wrapper
-
-
-Expected directory structure
---------------------------
-
-
-LoveDA/
-│
-├── train/
-│   ├── rural/
-│   │   ├── images/
-│   │   └── masks/
-│   └── urban/
-│       ├── images/
-│       └── masks/
-│
-├── val/
-│   └── ...
-│
-└── test/
-    └── ...
-
-
-Dataset: https://github.com/JiauZhang/LoveDA
+LoveDA Semantic Segmentation Dataset
 """
 
 
@@ -48,15 +24,25 @@ class LoveDADataset(BaseSegmentationDataset):
     IGNORE_INDEX = 255
 
 
-    # LoveDA class definitions
     CLASSES = [
-        "background",       # 0
-        "building",         # 1
-        "road",             # 2
-        "water",            # 3
-        "barren",           # 4
-        "forest",           # 5
-        "agriculture",       # 6
+        "background",
+        "building",
+        "road",
+        "water",
+        "barren",
+        "forest",
+        "agriculture",
+    ]
+
+
+    PALETTE = [
+        (0, 0, 0),
+        (255, 0, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (159, 129, 183),
+        (0, 255, 0),
+        (255, 195, 128),
     ]
 
 
@@ -66,9 +52,9 @@ class LoveDADataset(BaseSegmentationDataset):
         split="train",
         transform=None,
         normalize=None,
-        scenes=None,
     ):
-        self.scenes = scenes or ["rural", "urban"]
+
+
         super().__init__(
             root=root,
             split=split,
@@ -81,66 +67,72 @@ class LoveDADataset(BaseSegmentationDataset):
     def task_name(self):
 
 
-        return "land_cover"
+        return "lulc"
 
 
     def _build_index(self):
 
 
+        image_dir = self.root / self.split / "images"
+        mask_dir = self.root / self.split / "masks"
+
+
+        image_files = sorted(
+            list(image_dir.glob("*.png"))
+            + list(image_dir.glob("*.jpg"))
+            + list(image_dir.glob("*.tif"))
+            + list(image_dir.glob("*.npy"))
+        )
+
+
         samples = []
 
 
-        for scene in self.scenes:
-            image_dir = self.root / self.split / scene / "images"
-            mask_dir = self.root / self.split / scene / "masks"
+        for image_path in image_files:
 
 
-            if not image_dir.exists():
+            stem = image_path.stem
+
+
+            mask_path = None
+
+
+            for ext in [
+                ".png",
+                ".tif",
+                ".tiff",
+                ".npy",
+            ]:
+
+
+                candidate = mask_dir / (stem + ext)
+
+
+                if candidate.exists():
+
+
+                    mask_path = candidate
+
+
+                    break
+
+
+            if mask_path is None:
                 continue
 
 
-            image_files = sorted(
-                list(image_dir.glob("*.tif"))
-                + list(image_dir.glob("*.tiff"))
-                + list(image_dir.glob("*.png"))
-                + list(image_dir.glob("*.npy"))
+            samples.append(
+                {
+                    "image": str(image_path),
+                    "mask": str(mask_path),
+                    "id": stem,
+                }
             )
 
 
-            for image_path in image_files:
-                stem = f"{scene}_{image_path.stem}"
-
-
-                mask_path = None
-
-
-                for ext in [".tif", ".tiff", ".png", ".npy"]:
-                    candidate = mask_dir / (image_path.stem + ext)
-
-
-                    if candidate.exists():
-                        mask_path = candidate
-                        break
-
-
-                if mask_path is None:
-                    continue
-
-
-                samples.append(
-                    {
-                        "image": str(image_path),
-                        "mask": str(mask_path),
-                        "id": stem,
-                    }
-                )
-
-
         if len(samples) == 0:
-
-
             raise RuntimeError(
-                f"No samples found in {self.root / self.split}"
+                f"No samples found in {image_dir}"
             )
 
 
@@ -159,20 +151,10 @@ class LoveDADataset(BaseSegmentationDataset):
             image = np.load(path).astype(np.float32)
 
 
-        elif path.suffix == ".png":
-
-
-            import PIL.Image
-            img = PIL.Image.open(path)
-            image = np.array(img).transpose(2, 0, 1).astype(np.float32)
-
-
         else:
 
 
             with rasterio.open(path) as src:
-
-
                 image = src.read().astype(np.float32)
 
 
@@ -191,27 +173,14 @@ class LoveDADataset(BaseSegmentationDataset):
             mask = np.load(path)
 
 
-        elif path.suffix == ".png":
-
-
-            import PIL.Image
-            img = PIL.Image.open(path)
-            mask = np.array(img)
-
-
         else:
 
 
             with rasterio.open(path) as src:
-
-
                 mask = src.read(1)
 
 
-        mask = mask.astype(np.int64)
-
-
-        return mask
+        return mask.astype(np.int64)
 
 
     @property
@@ -225,12 +194,4 @@ class LoveDADataset(BaseSegmentationDataset):
     def palette(self):
 
 
-        return [
-            (0, 0, 0),           # background - black
-            (255, 0, 0),         # building - red
-            (128, 128, 128),      # road - gray
-            (0, 0, 255),         # water - blue
-            (139, 69, 19),       # barren - brown
-            (0, 128, 0),         # forest - green
-            (255, 255, 0),       # agriculture - yellow
-        ]
+        return self.PALETTE

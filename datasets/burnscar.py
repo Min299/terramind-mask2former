@@ -1,27 +1,5 @@
 """
 HLS Burn Scar Dataset Wrapper
-
-
-Expected directory structure
---------------------------
-
-
-HLSBurnScar/
-│
-├── train/
-│   ├── images/
-│   └── masks/
-│
-├── val/
-│   ├── images/
-│   └── masks/
-│
-└── test/
-    ├── images/
-    └── masks/
-
-
-Dataset: https://burnscar.vito.be/
 """
 
 
@@ -37,7 +15,7 @@ from .base_dataset import BaseSegmentationDataset
 
 
 
-class HLSBurnScarDataset(BaseSegmentationDataset):
+class BurnScarDataset(BaseSegmentationDataset):
 
 
     NUM_CLASSES = 2
@@ -67,7 +45,7 @@ class HLSBurnScarDataset(BaseSegmentationDataset):
     def task_name(self):
 
 
-        return "burn_scar"
+        return "burnscar"
 
 
     def _build_index(self):
@@ -96,24 +74,23 @@ class HLSBurnScarDataset(BaseSegmentationDataset):
             mask_path = None
 
 
-            for ext in [".tif", ".tiff", ".png", ".npy"]:
+            for ext in [
+                ".tif",
+                ".tiff",
+                ".png",
+                ".npy",
+            ]:
 
 
                 candidate = mask_dir / (stem + ext)
 
 
                 if candidate.exists():
-
-
                     mask_path = candidate
-
-
                     break
 
 
             if mask_path is None:
-
-
                 continue
 
 
@@ -127,8 +104,6 @@ class HLSBurnScarDataset(BaseSegmentationDataset):
 
 
         if len(samples) == 0:
-
-
             raise RuntimeError(
                 f"No samples found in {image_dir}"
             )
@@ -153,8 +128,6 @@ class HLSBurnScarDataset(BaseSegmentationDataset):
 
 
             with rasterio.open(path) as src:
-
-
                 image = src.read().astype(np.float32)
 
 
@@ -177,17 +150,7 @@ class HLSBurnScarDataset(BaseSegmentationDataset):
 
 
             with rasterio.open(path) as src:
-
-
                 mask = src.read(1)
-
-
-        mask = mask.astype(np.int64)
-
-
-        #
-        # ensure binary
-        #
 
 
         mask = (mask > 0).astype(np.int64)
@@ -201,8 +164,8 @@ class HLSBurnScarDataset(BaseSegmentationDataset):
 
 
         return [
-            "unburned",
-            "burned",
+            "background",
+            "burnscar",
         ]
 
 
@@ -211,6 +174,6 @@ class HLSBurnScarDataset(BaseSegmentationDataset):
 
 
         return [
-            (0, 0, 0),       # unburned - black
-            (139, 69, 19),   # burned - brown
+            (0, 0, 0),
+            (255, 0, 0),
         ]
