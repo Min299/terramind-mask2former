@@ -8,6 +8,8 @@ from .transforms import (
     TrainTransforms,
     ValTransforms,
 )
+from .preprocessing import normalize_image, prepare_multiclass_mask
+from .collate import multitask_collate_fn
 
 __all__ = [
     "BaseSegmentationDataset",
@@ -18,4 +20,7 @@ __all__ = [
     "get_val_transforms",
     "TrainTransforms",
     "ValTransforms",
+    "normalize_image",
+    "prepare_multiclass_mask",
+    "multitask_collate_fn",
 ]

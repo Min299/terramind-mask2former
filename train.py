@@ -1,14 +1,11 @@
 """
 Training script for TerraMind + Mask2Former.
 
-
 Usage:
-    python train.py --config config.yaml
-    python train.py --model_path checkpoints/best.pth
+    python train.py --flood_data ROOT --burn_data ROOT --lulc_data ROOT
 """
 
 import argparse
-import os
 from pathlib import Path
 
 import torch
@@ -21,6 +18,7 @@ from datasets import (
     LoveDADataset,
     get_train_transforms,
     get_val_transforms,
+    multitask_collate_fn,
 )
 from losses import HungarianMatcher, SetCriterion
 from models import (
@@ -28,23 +26,16 @@ from models import (
     TerraMindNeck,
     MSDeformAttnPixelDecoder,
     MultiScaleMaskedTransformerDecoder,
+    MultiTaskMask2Former,
 )
 from engine import Trainer
 
 
-def build_dataloader(dataset_name, root, batch_size, num_workers, split="train"):
-    """Build dataloader for a dataset."""
-    
+def build_dataloader(dataset_class, root, batch_size, num_workers, split="train"):
+    """Build dataloader with collate function."""
     transform = get_train_transforms(image_size=224) if split == "train" else get_val_transforms(image_size=224)
     
-    if dataset_name == "sen1flood11":
-        dataset = Sen1Flood11Dataset(root=root, split=split, transform=transform)
-    elif dataset_name == "burnscar":
-        dataset = BurnScarDataset(root=root, split=split, transform=transform)
-    elif dataset_name == "loveda":
-        dataset = LoveDADataset(root=root, split=split, transform=transform)
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
+    dataset = dataset_class(root=root, split=split, transform=transform)
     
     loader = DataLoader(
         dataset,
@@ -52,6 +43,7 @@ def build_dataloader(dataset_name, root, batch_size, num_workers, split="train")
         shuffle=(split == "train"),
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=multitask_collate_fn,
     )
     
     return loader
@@ -59,7 +51,6 @@ def build_dataloader(dataset_name, root, batch_size, num_workers, split="train")
 
 def build_model(cfg):
     """Build the full model."""
-    
     # Encoder (frozen)
     encoder = TerraMindEncoder(
         backbone_name=cfg.backbone_name,
@@ -69,9 +60,14 @@ def build_model(cfg):
         freeze=cfg.freeze_backbone,
     )
     
+    # Get encoder output channels
+    enc_channels = encoder.out_channels
+    if isinstance(enc_channels, list):
+        enc_channels = enc_channels[0]
+    
     # Neck
     neck = TerraMindNeck(
-        embed_dim=encoder.out_channels[0] if isinstance(encoder.out_channels, list) else encoder.out_channels,
+        embed_dim=enc_channels,
         hidden_dim=cfg.hidden_dim,
     )
     
@@ -84,21 +80,39 @@ def build_model(cfg):
     )
     
     # Task-specific decoders
-    decoders = {}
-    for task_name, num_classes in [("flood", 2), ("burnscar", 2), ("lulc", 7)]:
-        decoders[task_name] = MultiScaleMaskedTransformerDecoder(
+    decoders = {
+        "flood": MultiScaleMaskedTransformerDecoder(
             in_channels=cfg.hidden_dim,
-            num_classes=num_classes,
+            num_classes=2,  # Sen1Flood11: background, flood
             hidden_dim=cfg.hidden_dim,
             num_queries=cfg.num_queries,
             nheads=cfg.nheads,
             dim_feedforward=cfg.dim_feedforward,
             dec_layers=cfg.dec_layers,
             mask_dim=cfg.mask_dim,
-        )
+        ),
+        "burn": MultiScaleMaskedTransformerDecoder(
+            in_channels=cfg.hidden_dim,
+            num_classes=2,  # BurnScar: background, burned
+            hidden_dim=cfg.hidden_dim,
+            num_queries=cfg.num_queries,
+            nheads=cfg.nheads,
+            dim_feedforward=cfg.dim_feedforward,
+            dec_layers=cfg.dec_layers,
+            mask_dim=cfg.mask_dim,
+        ),
+        "lulc": MultiScaleMaskedTransformerDecoder(
+            in_channels=cfg.hidden_dim,
+            num_classes=7,  # LoveDA: 7 classes
+            hidden_dim=cfg.hidden_dim,
+            num_queries=cfg.num_queries,
+            nheads=cfg.nheads,
+            dim_feedforward=cfg.dim_feedforward,
+            dec_layers=cfg.dec_layers,
+            mask_dim=cfg.mask_dim,
+        ),
+    }
     
-    # Build model wrapper (placeholder - implement multitask_model.py separately)
-    from models.multitask_model import MultiTaskMask2Former
     model = MultiTaskMask2Former(
         encoder=encoder,
         neck=neck,
@@ -139,10 +153,8 @@ def build_criterion(cfg):
 
 
 def main(args):
-    # Load config
     cfg = ModelConfig()
     
-    # Override with args if provided
     if args.epochs:
         cfg.epochs = args.epochs
     if args.batch_size:
@@ -150,69 +162,85 @@ def main(args):
     if args.lr:
         cfg.lr = args.lr
     
-    # Device
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     
-    # Build model
     print("Building model...")
     model = build_model(cfg)
     model = model.to(device)
     
-    # Build criterion
+    print("Building criterion...")
     criterion = build_criterion(cfg)
     criterion = criterion.to(device)
     
-    # Build dataloaders
     print("Building dataloaders...")
-    train_loader = build_dataloader(
-        args.dataset,
-        args.data_root,
-        cfg.batch_size,
-        cfg.workers,
-        split="train",
+    # Flood dataloaders
+    flood_train = build_dataloader(
+        Sen1Flood11Dataset, args.flood_data, cfg.batch_size, cfg.workers, "train"
     )
-    val_loader = build_dataloader(
-        args.dataset,
-        args.data_root,
-        cfg.batch_size,
-        cfg.workers,
-        split="val",
+    flood_val = build_dataloader(
+        Sen1Flood11Dataset, args.flood_data, cfg.batch_size, cfg.workers, "val"
     )
     
-    # Build trainer
+    # Burn dataloaders
+    burn_train = build_dataloader(
+        BurnScarDataset, args.burn_data, cfg.batch_size, cfg.workers, "train"
+    )
+    burn_val = build_dataloader(
+        BurnScarDataset, args.burn_data, cfg.batch_size, cfg.workers, "val"
+    )
+    
+    # LULC dataloaders
+    lulc_train = build_dataloader(
+        LoveDADataset, args.lulc_data, cfg.batch_size, cfg.workers, "train"
+    )
+    lulc_val = build_dataloader(
+        LoveDADataset, args.lulc_data, cfg.batch_size, cfg.workers, "val"
+    )
+    
+    print("Building trainer...")
     trainer = Trainer(
         model=model,
         criterion=criterion,
-        train_loader=train_loader,
-        val_loader=val_loader,
+        flood_train_loader=flood_train,
+        burn_train_loader=burn_train,
+        lulc_train_loader=lulc_train,
+        flood_val_loader=flood_val,
+        burn_val_loader=burn_val,
+        lulc_val_loader=lulc_val,
         device=device,
         epochs=cfg.epochs,
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
         output_dir=args.output_dir,
         amp=cfg.amp,
+        task_schedule=args.schedule,
     )
     
-    # Resume from checkpoint if provided
     if args.resume:
         print(f"Resuming from {args.resume}...")
         trainer.load_checkpoint(args.resume)
     
-    # Train
     trainer.train()
-    
     print(f"Best model saved to {args.output_dir}/best.pth")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train TerraMind + Mask2Former")
-    parser.add_argument("--data_root", type=str, required=True, help="Path to dataset")
-    parser.add_argument("--dataset", type=str, required=True, choices=["sen1flood11", "burnscar", "loveda"])
+    parser = argparse.ArgumentParser(description="Train TerraMind + Mask2Former (Multi-Task)")
+    parser.add_argument("--flood_data", type=str, required=True, help="Path to Sen1Flood11 dataset")
+    parser.add_argument("--burn_data", type=str, required=True, help="Path to HLS Burn Scar dataset")
+    parser.add_argument("--lulc_data", type=str, required=True, help="Path to LoveDA dataset")
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument(
+        "--schedule",
+        type=str,
+        nargs="+",
+        default=["flood", "burn", "lulc"],
+        help="Task schedule (e.g., flood burn lulc or flood flood burn lulc)",
+    )
     
     args = parser.parse_args()
     main(args)
