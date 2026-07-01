@@ -1,113 +1,227 @@
 """
-Sen1Flood11 Dataset.
+Sen1Flood11 Dataset Wrapper
 
 
-Flood detection from Sentinel-1 SAR imagery.
+Expected directory structure
+----------------------------
 
 
-Dataset: https://arxiv.org/abs/2009.00255
+Sen1Flood11/
+│
+├── train/
+│   ├── images/
+│   └── masks/
+│
+├── val/
+│   ├── images/
+│   └── masks/
+│
+└── test/
+    ├── images/
+    └── masks/
+
+
+Images may be GeoTIFF (.tif) or .npy depending on preprocessing.
+Masks are binary (0=background, 1=flood).
 """
 
 
 from pathlib import Path
-from typing import List, Dict
 
 
 import numpy as np
-import torch
+import rasterio
 
 
 from .base_dataset import BaseSegmentationDataset
 
 
+
+
 class Sen1Flood11Dataset(BaseSegmentationDataset):
-    """
-    Sen1Flood11 for flood detection.
-    
-    Binary segmentation: flood (1) vs no flood (0)
-    """
-    
-    # Class definitions
-    CLASSES = ["no_flood", "flood"]
+
+
     NUM_CLASSES = 2
-    
-    # Label mapping (raw label -> class index)
-    LABEL_MAP = {
-        0: 0,   # No Flood
-        255: 1, # Flood
-    }
-    
-    # Bands to load from SAR imagery
-    BANDS = ["VV", "VH"]  # Sentinel-1 dual-pol
-    
+
+
+    IGNORE_INDEX = 255
+
+
     def __init__(
         self,
-        root: str,
-        split: str = "train",
+        root,
+        split="train",
         transform=None,
         normalize=None,
     ):
-        super().__init__(root, split, transform, normalize)
-    
+
+
+        super().__init__(
+            root=root,
+            split=split,
+            transform=transform,
+            normalize=normalize,
+        )
+
+
     @property
-    def task_name(self) -> str:
-        return "flood_detection"
-    
-    def _build_index(self) -> List[Dict]:
-        """
-        Build index of image-mask pairs.
-        
-        Customize paths based on your data organization.
-        """
+    def task_name(self):
+
+
+        return "flood"
+
+
+    def _build_index(self):
+
+
+        image_dir = self.root / self.split / "images"
+        mask_dir = self.root / self.split / "masks"
+
+
+        image_files = sorted(
+            list(image_dir.glob("*.tif"))
+            + list(image_dir.glob("*.tiff"))
+            + list(image_dir.glob("*.npy"))
+        )
+
+
         samples = []
-        
-        # Example structure - adjust to your data layout
-        images_dir = self.root / self.split / "images"
-        masks_dir = self.root / self.split / "masks"
-        
-        if not images_dir.exists():
-            raise FileNotFoundError(f"Images directory not found: {images_dir}")
-        
-        # Find all tif files
-        for img_path in sorted(images_dir.glob("*.tif")):
-            mask_path = masks_dir / img_path.name
-            
-            if mask_path.exists():
-                samples.append({
-                    "image": str(img_path),
+
+
+        for image_path in image_files:
+
+
+            stem = image_path.stem
+
+
+            #
+            # search corresponding mask
+            #
+
+
+            mask_path = None
+
+
+            for ext in [
+                ".tif",
+                ".tiff",
+                ".png",
+                ".npy",
+            ]:
+
+
+                candidate = mask_dir / (stem + ext)
+
+
+                if candidate.exists():
+
+
+                    mask_path = candidate
+
+
+                    break
+
+
+            if mask_path is None:
+
+
+                continue
+
+
+            samples.append(
+                {
+                    "image": str(image_path),
                     "mask": str(mask_path),
-                    "id": img_path.stem,
-                })
-        
+                    "id": stem,
+                }
+            )
+
+
+        if len(samples) == 0:
+
+
+            raise RuntimeError(
+                f"No samples found in {image_dir}"
+            )
+
+
         return samples
-    
-    def _load_image(self, path: str) -> np.ndarray:
-        """
-        Load SAR image with VV and VH bands.
-        
-        Returns:
-            np.ndarray of shape [2, H, W]
-        """
-        image = self.read_raster(path)
-        
-        # Ensure we have the right bands
-        # Adjust based on actual band ordering in your data
-        if image.shape[0] > 2:
-            image = image[:2]  # Take first 2 bands
-        
+
+
+    def _load_image(self, path):
+
+
+        path = Path(path)
+
+
+        if path.suffix == ".npy":
+
+
+            image = np.load(path).astype(np.float32)
+
+
+        else:
+
+
+            with rasterio.open(path) as src:
+
+
+                image = src.read().astype(np.float32)
+
+
         return image
-    
-    def _load_mask(self, path: str) -> np.ndarray:
-        """
-        Load flood mask.
-        
-        Returns:
-            np.ndarray of shape [H, W] with values 0 or 1
-        """
-        mask = self.read_raster(path).squeeze().astype(np.int64)
-        
-        # Remap labels
-        for orig_label, new_label in self.LABEL_MAP.items():
-            mask[mask == orig_label] = new_label
-        
+
+
+    def _load_mask(self, path):
+
+
+        path = Path(path)
+
+
+        if path.suffix == ".npy":
+
+
+            mask = np.load(path)
+
+
+        else:
+
+
+            with rasterio.open(path) as src:
+
+
+                mask = src.read(1)
+
+
+        mask = mask.astype(np.int64)
+
+
+        #
+        # ensure binary
+        #
+
+
+        mask = (mask > 0).astype(np.int64)
+
+
         return mask
+
+
+    @property
+    def class_names(self):
+
+
+        return [
+            "background",
+            "flood",
+        ]
+
+
+    @property
+    def palette(self):
+
+
+        return [
+            (0, 0, 0),
+            (0, 0, 255),
+        ]

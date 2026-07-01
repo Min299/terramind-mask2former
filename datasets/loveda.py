@@ -1,8 +1,26 @@
 """
-LoveDA Dataset.
+LoveDA Dataset Wrapper
 
 
-Land cover mapping from aerial imagery.
+Expected directory structure
+--------------------------
+
+
+LoveDA/
+│
+├── train/
+│   ├── rural/
+│   │   ├── images/
+│   │   └── masks/
+│   └── urban/
+│       ├── images/
+│       └── masks/
+│
+├── val/
+│   └── ...
+│
+└── test/
+    └── ...
 
 
 Dataset: https://github.com/JiauZhang/LoveDA
@@ -10,23 +28,27 @@ Dataset: https://github.com/JiauZhang/LoveDA
 
 
 from pathlib import Path
-from typing import List, Dict
 
 
 import numpy as np
+import rasterio
 
 
 from .base_dataset import BaseSegmentationDataset
 
 
+
+
 class LoveDADataset(BaseSegmentationDataset):
-    """
-    LoveDA for land cover semantic segmentation.
-    
-    Multi-class segmentation: 7 land cover classes
-    """
-    
-    # Class definitions (LoveDA standard)
+
+
+    NUM_CLASSES = 7
+
+
+    IGNORE_INDEX = 255
+
+
+    # LoveDA class definitions
     CLASSES = [
         "background",       # 0
         "building",         # 1
@@ -34,91 +56,181 @@ class LoveDADataset(BaseSegmentationDataset):
         "water",            # 3
         "barren",           # 4
         "forest",           # 5
-        "agriculture",      # 6
+        "agriculture",       # 6
     ]
-    NUM_CLASSES = 7
-    
-    # Label mapping (if different from class index)
-    LABEL_MAP = {}  # No remapping needed for LoveDA standard
-    
-    # Bands for RGB aerial imagery
-    BANDS = ["R", "G", "B"]
-    
+
+
     def __init__(
         self,
-        root: str,
-        split: str = "train",
+        root,
+        split="train",
         transform=None,
         normalize=None,
+        scenes=None,
     ):
-        super().__init__(root, split, transform, normalize)
-    
+        self.scenes = scenes or ["rural", "urban"]
+        super().__init__(
+            root=root,
+            split=split,
+            transform=transform,
+            normalize=normalize,
+        )
+
+
     @property
-    def task_name(self) -> str:
+    def task_name(self):
+
+
         return "land_cover"
-    
-    def _build_index(self) -> List[Dict]:
-        """
-        Build index of image-mask pairs.
-        
-        Customize paths based on your data organization.
-        """
+
+
+    def _build_index(self):
+
+
         samples = []
-        
-        # Example structure - adjust to your data layout
-        # LoveDA has separate directories for rural/urban scenes
-        for scene in ["rural", "urban"]:
-            images_dir = self.root / self.split / scene / "images"
-            masks_dir = self.root / self.split / scene / "masks"
-            
-            if not images_dir.exists():
+
+
+        for scene in self.scenes:
+            image_dir = self.root / self.split / scene / "images"
+            mask_dir = self.root / self.split / scene / "masks"
+
+
+            if not image_dir.exists():
                 continue
-            
-            # Find all files
-            for ext in ["*.png", "*.tif"]:
-                for img_path in sorted(images_dir.glob(ext)):
-                    # LoveDA naming convention: xxx.png -> xxx.png
-                    mask_path = masks_dir / img_path.name
-                    
-                    if mask_path.exists():
-                        samples.append({
-                            "image": str(img_path),
-                            "mask": str(mask_path),
-                            "id": f"{scene}_{img_path.stem}",
-                        })
-        
+
+
+            image_files = sorted(
+                list(image_dir.glob("*.tif"))
+                + list(image_dir.glob("*.tiff"))
+                + list(image_dir.glob("*.png"))
+                + list(image_dir.glob("*.npy"))
+            )
+
+
+            for image_path in image_files:
+                stem = f"{scene}_{image_path.stem}"
+
+
+                mask_path = None
+
+
+                for ext in [".tif", ".tiff", ".png", ".npy"]:
+                    candidate = mask_dir / (image_path.stem + ext)
+
+
+                    if candidate.exists():
+                        mask_path = candidate
+                        break
+
+
+                if mask_path is None:
+                    continue
+
+
+                samples.append(
+                    {
+                        "image": str(image_path),
+                        "mask": str(mask_path),
+                        "id": stem,
+                    }
+                )
+
+
+        if len(samples) == 0:
+
+
+            raise RuntimeError(
+                f"No samples found in {self.root / self.split}"
+            )
+
+
         return samples
-    
-    def _load_image(self, path: str) -> np.ndarray:
-        """
-        Load RGB aerial image.
-        
-        Returns:
-            np.ndarray of shape [3, H, W]
-        """
-        image = self.read_raster(path)
-        
-        # Handle different formats
-        if image.ndim == 3:
-            # CHW format
-            pass
-        elif image.ndim == 2:
-            # Single band - expand to 3 channels
-            image = np.stack([image, image, image], axis=0)
-        
+
+
+    def _load_image(self, path):
+
+
+        path = Path(path)
+
+
+        if path.suffix == ".npy":
+
+
+            image = np.load(path).astype(np.float32)
+
+
+        elif path.suffix == ".png":
+
+
+            import PIL.Image
+            img = PIL.Image.open(path)
+            image = np.array(img).transpose(2, 0, 1).astype(np.float32)
+
+
+        else:
+
+
+            with rasterio.open(path) as src:
+
+
+                image = src.read().astype(np.float32)
+
+
         return image
-    
-    def _load_mask(self, path: str) -> np.ndarray:
-        """
-        Load land cover mask.
-        
-        Returns:
-            np.ndarray of shape [H, W] with class indices
-        """
-        mask = self.read_raster(path).squeeze().astype(np.int64)
-        
-        # Remap labels if needed
-        for orig_label, new_label in self.LABEL_MAP.items():
-            mask[mask == orig_label] = new_label
-        
+
+
+    def _load_mask(self, path):
+
+
+        path = Path(path)
+
+
+        if path.suffix == ".npy":
+
+
+            mask = np.load(path)
+
+
+        elif path.suffix == ".png":
+
+
+            import PIL.Image
+            img = PIL.Image.open(path)
+            mask = np.array(img)
+
+
+        else:
+
+
+            with rasterio.open(path) as src:
+
+
+                mask = src.read(1)
+
+
+        mask = mask.astype(np.int64)
+
+
         return mask
+
+
+    @property
+    def class_names(self):
+
+
+        return self.CLASSES
+
+
+    @property
+    def palette(self):
+
+
+        return [
+            (0, 0, 0),           # background - black
+            (255, 0, 0),         # building - red
+            (128, 128, 128),      # road - gray
+            (0, 0, 255),         # water - blue
+            (139, 69, 19),       # barren - brown
+            (0, 128, 0),         # forest - green
+            (255, 255, 0),       # agriculture - yellow
+        ]
