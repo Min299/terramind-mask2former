@@ -1,183 +1,223 @@
 """
-Modules to compute the matching cost and solve the corresponding assignment problem.
+matcher.py
+
+Hungarian Matcher used by Mask2Former.
+
+Computes the optimal bipartite assignment between predicted queries
+and ground-truth masks.
+
+Matching cost:
+
+    cost =
+        cost_class +
+        cost_mask +
+        cost_dice
+
+The implementation closely follows the official Mask2Former matcher,
+adapted for the TerraMind multitask segmentation pipeline.
 """
 
+from typing import Dict, List, Tuple
+
 import torch
-import torch.nn.functional as F
-from scipy.optimize import linear_sum_assignment
 from torch import nn
+from torch.cuda.amp import autocast
+from scipy.optimize import linear_sum_assignment
 
-
-def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
-    """
-    Compute the DICE loss, similar to generalized IOU for masks
-    
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                 (0 for the negative class and 1 for the positive class).
-    """
-    inputs = inputs.sigmoid()
-    inputs = inputs.flatten(1)
-    numerator = 2 * torch.einsum("nc,mc->nm", inputs, targets)
-    denominator = inputs.sum(-1)[:, None] + targets.sum(-1)[None, :]
-    loss = 1 - (numerator + 1) / (denominator + 1)
-    return loss
-
-
-def batch_sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor):
-    """
-    Binary cross-entropy loss for masks.
-    
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                 (0 for the negative class and 1 for the positive class).
-    Returns:
-        Loss tensor
-    """
-    hw = inputs.shape[1]
-
-    pos = F.binary_cross_entropy_with_logits(
-        inputs, torch.ones_like(inputs), reduction="none"
-    )
-    neg = F.binary_cross_entropy_with_logits(
-        inputs, torch.zeros_like(inputs), reduction="none"
-    )
-
-    loss = torch.einsum("nc,mc->nm", pos, targets) + torch.einsum(
-        "nc,mc->nm", neg, (1 - targets)
-    )
-
-    return loss / hw
+from losses import (
+    batch_dice_cost,
+    batch_sigmoid_ce_cost,
+    sample_points,
+)
 
 
 class HungarianMatcher(nn.Module):
     """
-    This class computes an assignment between the targets and the predictions of the network.
+    Hungarian Matcher for Mask2Former.
 
-    For efficiency reasons, the targets don't include the no_object. Because of this, in general,
-    there are more predictions than targets. In this case, we do a 1-to-1 matching of the best predictions,
-    while the others are un-matched (and thus treated as non-objects).
+    For every image independently, computes the minimum-cost
+    assignment between decoder queries and ground-truth masks.
     """
 
     def __init__(
-        self, 
-        cost_class: float = 1, 
-        cost_mask: float = 1, 
-        cost_dice: float = 1, 
-        num_points: int = 12544
+        self,
+        cost_class: float = 2.0,
+        cost_mask: float = 5.0,
+        cost_dice: float = 5.0,
+        num_points: int = 12544,
     ):
-        """
-        Creates the matcher
-
-        Params:
-            cost_class: This is the relative weight of the classification error in the matching cost
-            cost_mask: This is the relative weight of the focal loss of the binary mask in the matching cost
-            cost_dice: This is the relative weight of the dice loss of the binary mask in the matching cost
-        """
         super().__init__()
+
+        assert (
+            cost_class != 0
+            or cost_mask != 0
+            or cost_dice != 0
+        ), "All matching costs cannot be zero."
+
         self.cost_class = cost_class
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
         self.num_points = num_points
 
-        assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
-
     @torch.no_grad()
-    def forward(self, outputs, targets):
+    def memory_efficient_forward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        targets: List[Dict[str, torch.Tensor]],
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Performs the matching
-
-        Params:
-            outputs: This is a dict that contains at least these entries:
-                 "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
-                 "pred_masks": Tensor of dim [batch_size, num_queries, H_pred, W_pred] with the predicted masks
-
-            targets: This is a list of targets (len(targets) = batch_size), where each target is a dict containing:
-                 "labels": Tensor of dim [num_target_boxes] containing the class labels
-                 "masks": Tensor of dim [num_target_boxes, H_gt, W_gt] containing the target masks
-
-        Returns:
-            A list of size batch_size, containing tuples of (index_i, index_j) where:
-                - index_i is the indices of the selected predictions (in order)
-                - index_j is the indices of the corresponding selected targets (in order)
-            For each batch element, it holds:
-                len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
+        Performs Hungarian matching independently
+        for every image in the batch.
         """
-        return self.memory_efficient_forward(outputs, targets)
 
-    @torch.no_grad()
-    def memory_efficient_forward(self, outputs, targets):
-        """More memory-friendly matching"""
         bs, num_queries = outputs["pred_logits"].shape[:2]
 
         indices = []
 
-        # Iterate through batch size
         for b in range(bs):
-            out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
-            tgt_ids = targets[b]["labels"]
 
-            # Compute the classification cost. Contrary to the loss, we don't use the NLL,
-            # but approximate it in 1 - proba[target class].
-            cost_class = -out_prob[:, tgt_ids]
+            #
+            # --------------------------------------------------
+            # Classification Cost
+            # --------------------------------------------------
+            #
 
-            out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
-            tgt_mask = targets[b]["masks"].to(out_mask)
+            out_prob = outputs["pred_logits"][b].softmax(-1)
 
-            # Sample points for efficient matching
-            point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
-            
-            # Sample at points
-            tgt_mask_flat = self._sample_points(tgt_mask[None], point_coords, tgt_mask.shape[0])
-            out_mask_flat = self._sample_points(out_mask[None], point_coords, out_mask.shape[0])
+            tgt_labels = targets[b]["labels"]
 
-            # Compute mask costs
-            cost_mask = batch_sigmoid_ce_loss(out_mask_flat, tgt_mask_flat)
-            cost_dice = batch_dice_loss(out_mask_flat, tgt_mask_flat)
+            cost_class = -out_prob[:, tgt_labels]
 
-            # Final cost matrix
-            C = (
-                self.cost_mask * cost_mask
-                + self.cost_class * cost_class
+            #
+            # --------------------------------------------------
+            # Mask Cost
+            # --------------------------------------------------
+            #
+
+            pred_masks = outputs["pred_masks"][b]
+            gt_masks = targets[b]["masks"].to(pred_masks)
+
+            pred_masks = pred_masks[:, None]
+            gt_masks = gt_masks[:, None]
+
+            #
+            # Sample SAME random points from both prediction
+            # and target masks (official Mask2Former)
+            #
+
+            point_coords = torch.rand(
+                1,
+                self.num_points,
+                2,
+                device=pred_masks.device,
+            )
+
+            sampled_gt = sample_points(
+                gt_masks,
+                point_coords.repeat(
+                    gt_masks.shape[0],
+                    1,
+                    1,
+                ),
+                align_corners=False,
+            ).squeeze(1)
+
+            sampled_pred = sample_points(
+                pred_masks,
+                point_coords.repeat(
+                    pred_masks.shape[0],
+                    1,
+                    1,
+                ),
+                align_corners=False,
+            ).squeeze(1)
+
+            #
+            # --------------------------------------------------
+            # Pairwise Costs
+            # --------------------------------------------------
+            #
+
+            with autocast(enabled=False):
+
+                sampled_pred = sampled_pred.float()
+                sampled_gt = sampled_gt.float()
+
+                cost_mask = batch_sigmoid_ce_cost(
+                    sampled_pred,
+                    sampled_gt,
+                )
+
+                cost_dice = batch_dice_cost(
+                    sampled_pred,
+                    sampled_gt,
+                )
+
+            #
+            # --------------------------------------------------
+            # Final Cost Matrix
+            # --------------------------------------------------
+            #
+
+            cost = (
+                self.cost_class * cost_class
+                + self.cost_mask * cost_mask
                 + self.cost_dice * cost_dice
             )
-            C = C.reshape(num_queries, -1).cpu()
 
-            indices.append(linear_sum_assignment(C))
+            cost = cost.reshape(
+                num_queries,
+                -1,
+            ).cpu()
 
-        return [
-            (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-            for i, j in indices
+            pred_ind, tgt_ind = linear_sum_assignment(
+                cost
+            )
+
+            indices.append(
+                (
+                    torch.as_tensor(
+                        pred_ind,
+                        dtype=torch.int64,
+                    ),
+                    torch.as_tensor(
+                        tgt_ind,
+                        dtype=torch.int64,
+                    ),
+                )
+            )
+
+        return indices
+
+    @torch.no_grad()
+    def forward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        targets: List[Dict[str, torch.Tensor]],
+    ):
+        """
+        Returns
+        -------
+        List[
+            (
+                prediction_indices,
+                target_indices
+            )
         ]
+        """
 
-    def _sample_points(self, masks, point_coords, num_masks):
-        """Sample masks at point coordinates."""
-        # masks: [1, N, H, W] -> [N, H, W]
-        masks = masks.squeeze(0)
-        # Reshape for sampling: [N, 1, H, W]
-        masks = masks[:, None]
-        
-        # Sample at point coordinates
-        sampled = F.grid_sample(
-            masks, 
-            point_coords.repeat(num_masks, 1, 1), 
-            align_corners=False, 
-            mode='bilinear'
+        return self.memory_efficient_forward(
+            outputs,
+            targets,
         )
-        return sampled.squeeze(1).T  # [num_points, num_masks]
 
-    def __repr__(self, _repr_indent=4):
-        head = "Matcher " + self.__class__.__name__
-        body = [
-            "cost_class: {}".format(self.cost_class),
-            "cost_mask: {}".format(self.cost_mask),
-            "cost_dice: {}".format(self.cost_dice),
-        ]
-        lines = [head] + [" " * _repr_indent + line for line in body]
-        return "\n".join(lines)
+    def __repr__(self):
+
+        return (
+            f"{self.__class__.__name__}(\n"
+            f"  cost_class={self.cost_class},\n"
+            f"  cost_mask={self.cost_mask},\n"
+            f"  cost_dice={self.cost_dice},\n"
+            f"  num_points={self.num_points}\n"
+            f")"
+        )

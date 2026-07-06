@@ -1,169 +1,148 @@
 """
-MSDeformAttn Pixel Decoder.
-
-This decoder takes multi-scale features from the TerraMind neck and produces
-the mask_features and multi-scale features needed by the transformer decoder.
+MSDeformAttn Pixel Decoder matched to feature schemas returned by the TerraMind backbone.
+Optimized for zero-overhead routing, exact Mask2Former architectural fidelity, 
+and consistent GELU activation profiles.
 """
 
-from typing import Dict, List, Optional
-import numpy as np
+from typing import Dict, List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .ms_deform_attn import MSDeformAttnTransformerEncoderOnly
 from .position_encoding import PositionEmbeddingSine
-from .layers import ConvNormAct
+
+
+def _get_norm_groups(conv_dim: int) -> int:
+    """Dynamically determine GroupNorm groups to avoid crashes on non-standard channel sizes."""
+    groups = min(32, conv_dim)
+    while conv_dim % groups != 0:
+        groups -= 1
+    return groups
 
 
 class MSDeformAttnPixelDecoder(nn.Module):
-    """
-    MSDeformAttn-based Pixel Decoder.
-    
-    Takes multi-scale feature maps and produces:
-    - mask_features: Final high-resolution features for mask prediction
-    - multi_scale_features: Features at multiple scales for transformer decoder
-    """
-
     def __init__(
         self,
-        in_channels: List[int],
         transformer_dropout: float = 0.0,
         transformer_nheads: int = 8,
         transformer_dim_feedforward: int = 1024,
         transformer_enc_layers: int = 6,
         conv_dim: int = 256,
         mask_dim: int = 256,
-        num_feature_levels: int = 4,
-        common_stride: int = 4,
     ):
         super().__init__()
-
-        self.in_channels = in_channels
+        
         self.conv_dim = conv_dim
         self.mask_dim = mask_dim
-        self.num_feature_levels = num_feature_levels
-        self.common_stride = common_stride
+        
+        # Explicit feature level constants
+        self.transformer_levels = ("res5", "res4", "res3")
+        self.fpn_level = "res2"
+        self.transformer_num_feature_levels = len(self.transformer_levels)
+        self.maskformer_num_feature_levels = 3  # Kept for external reference/consistency
 
-        # Input projections for each feature level
-        # From low resolution to high resolution
-        input_proj_list = []
-        for in_ch in in_channels[::-1]:
-            input_proj_list.append(nn.Sequential(
-                nn.Conv2d(in_ch, conv_dim, kernel_size=1),
-                nn.GroupNorm(32, conv_dim),
-            ))
-        self.input_proj = nn.ModuleList(input_proj_list)
-
-        # Initialize projections
-        for proj in self.input_proj:
-            nn.init.xavier_uniform_(proj[0].weight, gain=1)
-            nn.init.constant_(proj[0].bias, 0)
-
-        # MSDeformAttn Transformer Encoder
+        # 1. Transformer strictly limited to 3 semantic levels, using GELU
         self.transformer = MSDeformAttnTransformerEncoderOnly(
             d_model=conv_dim,
             dropout=transformer_dropout,
             nhead=transformer_nheads,
             dim_feedforward=transformer_dim_feedforward,
             num_encoder_layers=transformer_enc_layers,
-            num_feature_levels=num_feature_levels,
+            num_feature_levels=self.transformer_num_feature_levels,
+            activation="gelu",  # Ensures consistency with TerraMind & FPN Neck
         )
 
         N_steps = conv_dim // 2
         self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
 
-        # Mask feature projection
-        self.mask_features = nn.Conv2d(
-            conv_dim,
-            mask_dim,
-            kernel_size=1,
-            stride=1,
-            padding=0,
+        # 2. Single-step FPN for res2 ONLY
+        self.lateral_conv = nn.Conv2d(conv_dim, conv_dim, kernel_size=1)
+        self.output_conv = nn.Sequential(
+            nn.Conv2d(conv_dim, conv_dim, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(_get_norm_groups(conv_dim), conv_dim),
+            nn.GELU() 
         )
 
-        # FPN for multi-scale features
-        self.maskformer_num_feature_levels = 3
-        self._build_fpn()
+        # 3. Final Mask Features projection
+        self.mask_features = nn.Conv2d(conv_dim, mask_dim, kernel_size=1, stride=1, padding=0)
 
-    def _build_fpn(self):
-        """Build FPN for multi-scale features."""
-        in_strides = [4, 8, 16, 32]  # Assuming standard res2, res3, res4, res5
-        
-        # Number of FPN levels needed
-        min_stride = min(in_strides[:len(self.in_channels)])
-        self.num_fpn_levels = max(0, int(np.log2(min_stride) - np.log2(self.common_stride)))
+        self._init_weights()
 
-        self.lateral_convs = nn.ModuleList()
-        self.output_convs = nn.ModuleList()
+    def _init_weights(self):
+        """Apply Xavier/MSRA initialization matching the official Mask2Former implementation."""
+        for module in [self.lateral_conv, self.output_conv[0], self.mask_features]:
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
 
-        for idx, in_ch in enumerate(self.in_channels[:self.num_fpn_levels]):
-            lateral_conv = nn.Conv2d(in_ch, self.conv_dim, kernel_size=1, bias=True)
-            output_conv = ConvNormAct(self.conv_dim, self.conv_dim, 3)
+    def forward(self, features: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        srcs, pos = [], []
+        for name in self.transformer_levels:
+            if name not in features:
+                raise KeyError(f"PixelDecoder expected feature '{name}' from backbone.")
             
-            self.lateral_convs.append(lateral_conv)
-            self.output_convs.append(output_conv)
+            x = features[name]
+            # A3: Channel validation
+            if x.shape[1] != self.conv_dim:
+                raise ValueError(f"PixelDecoder expected {self.conv_dim} channels, got {x.shape[1]} from '{name}'.")
+            
+            srcs.append(x)
+            pos.append(self.pe_layer(x))
+        # ... rest of forward        
 
-    def forward(self, features: Dict[str, torch.Tensor]) -> tuple:
-        """
-        Forward pass.
-        
-        Args:
-            features: Dict of feature maps from TerraMind neck
-                      Keys: 'res2', 'res3', 'res4', 'res5'
-                      Values: [B, C, H, W]
-        
-        Returns:
-            mask_features: Final mask features [B, mask_dim, H, W]
-            multi_scale_features: List of [B, C, H, W] at multiple scales
-        """
-        srcs = []
-        pos = []
-        
-        # Get features in order (low to high resolution)
-        feature_names = ['res5', 'res4', 'res3', 'res2'][:self.num_feature_levels]
-        
-        for idx, name in enumerate(feature_names):
-            if name in features:
-                x = features[name].float()
-                src = self.input_proj[idx](x)
-                srcs.append(src)
-                pos.append(self.pe_layer(x))
-
-        if len(srcs) == 0:
-            raise ValueError("No features provided to pixel decoder")
-
-        # Run MSDeformAttn encoder
-        y, spatial_shapes, level_start_index = self.transformer(srcs, pos)
+        # Run multi-scale deformable attention encoder
+        y, spatial_shapes, _ = self.transformer(srcs, pos)
         bs = y.shape[0]
 
-        # Split output back to feature maps
-        split_sizes = []
-        for i in range(len(spatial_shapes)):
-            if i < len(spatial_shapes) - 1:
-                split_sizes.append(level_start_index[i + 1].item() - level_start_index[i].item())
-            else:
-                split_sizes.append(y.shape[1] - level_start_index[i].item())
-        
+        # Split the flattened output back into separate levels
+        split_sizes = [spatial_shapes[i][0] * spatial_shapes[i][1] for i in range(len(spatial_shapes))]
         y = torch.split(y, split_sizes, dim=1)
-        out = []
+        
+        # Reshape transformer tokens back to 2D spatial grids
+        transformer_features = []
         for i, z in enumerate(y):
             h, w = spatial_shapes[i]
-            out.append(z.transpose(1, 2).view(bs, -1, h, w))
-
-        # Apply FPN on lower-resolution features
-        for idx, lateral_conv in enumerate(self.lateral_convs):
-            if idx < len(out):
-                x = features.get(feature_names[idx], out[idx])
-                cur_fpn = lateral_conv(x)
-                y = cur_fpn + F.interpolate(out[-1], size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False)
-                y = self.output_convs[idx](y)
-                out.append(y)
-
-        # Collect multi-scale features for transformer decoder
-        multi_scale_features = out[:self.maskformer_num_feature_levels]
+            # .reshape() replaces .view() to safely handle non-contiguous memory from .transpose()
+            transformer_features.append(z.transpose(1, 2).reshape(bs, self.conv_dim, h, w))
+            
+        assert len(transformer_features) == 3, "Transformer must output exactly 3 levels."
         
-        # Final mask features from highest resolution
-        mask_features = self.mask_features(out[-1])
+        # transformer_features:
+        # [0] res5'
+        # [1] res4'
+        # [2] res3'
 
-        return mask_features, multi_scale_features
+        # ----------------------------------------------------------------------
+        # PIPELINE 2: FPN (Boundary Mask Feature)
+        # ----------------------------------------------------------------------
+        if self.fpn_level not in features:
+            raise ValueError(f"Expected feature '{self.fpn_level}' from backbone neck for FPN.")
+            
+        raw_res2 = features[self.fpn_level]     # No .float() cast
+        assert raw_res2.shape[1] == self.conv_dim, f"FPN input must have {self.conv_dim} channels."
+        
+        # 1x1 lateral projection to align the raw backbone feature
+        lateral = self.lateral_conv(raw_res2)
+        
+        # Upsample the contextualized res3' from the transformer
+        upsampled_res3 = F.interpolate(
+            transformer_features[-1], 
+            size=lateral.shape[-2:], 
+            mode="bilinear", 
+            align_corners=False
+        )
+        
+        # Fuse and smooth
+        fpn_res2 = self.output_conv(lateral + upsampled_res3)
+        
+        # Generate final highest-resolution mask feature
+        mask_features = self.mask_features(fpn_res2)
+
+        # ----------------------------------------------------------------------
+        # FINAL OUTPUTS
+        # ----------------------------------------------------------------------
+        return (
+            mask_features,
+            transformer_features,
+        )

@@ -1,346 +1,325 @@
 """
-Training engine for TerraMind + Mask2Former.
+trainer.py
 
-Responsibilities
-----------------
-• Build optimizer
-• Build scheduler
-• Mixed precision training
-• Round-robin task routing
-• Training
-• Validation with per-task metrics
-• Checkpointing
+Production-grade Multi-task training loop for TerraMind Mask2Former.
+Features AMP, Linear-Warmup-Cosine Scheduling, Early Stopping, 
+Full-State Checkpointing, and dynamic task routing.
 """
 
-
-from __future__ import annotations
-
-
-import time
-from pathlib import Path
-
+import os
+import math
+import random
+import numpy as np
+from typing import Dict, List, Optional
+from collections import defaultdict
 
 import torch
-import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
+from criterion import SetCriterion
+from matcher import HungarianMatcher
+from metrics import SegmentationMetrics
 
-def compute_iou(pred, target, num_classes, ignore_index=255):
-    """Compute IoU per class."""
-    pred = pred.view(-1)
-    target = target.view(-1)
-    
-    mask = target != ignore_index
-    pred = pred[mask]
-    target = target[mask]
-    
-    ious = []
-    for cls in range(num_classes):
-        pred_cls = pred == cls
-        target_cls = target == cls
+
+def get_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps):
+    """Linear warmup -> Cosine decay scheduler"""
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    return LambdaLR(optimizer, lr_lambda)
+
+
+def semantic_to_mask2former_targets(
+    semantic_masks: torch.Tensor, 
+    ignore_index: int = 255,
+    background_id: Optional[int] = None
+) -> List[Dict[str, torch.Tensor]]:
+    """
+    Converts standard [B, H, W] semantic masks to Set Prediction format.
+    Filters out ignore_index and optionally skips background_id.
+    """
+    targets = []
+    for i in range(semantic_masks.shape[0]):
+        mask_i = semantic_masks[i]
+        classes = torch.unique(mask_i)
         
-        intersection = (pred_cls & target_cls).sum().float()
-        union = (pred_cls | target_cls).sum().float()
-        
-        if union > 0:
-            ious.append((intersection / union).item())
+        # Filter out ignored/background pixels
+        classes = classes[classes != ignore_index]
+        if background_id is not None:
+            classes = classes[classes != background_id]
+
+        if len(classes) == 0:
+            labels = torch.zeros(0, dtype=torch.int64, device=mask_i.device)
+            masks = torch.zeros((0, mask_i.shape[0], mask_i.shape[1]), dtype=torch.float32, device=mask_i.device)
         else:
-            ious.append(float('nan'))
-    
-    return ious
+            masks = [(mask_i == c) for c in classes]
+            masks = torch.stack(masks).to(mask_i.device).float()
+            labels = classes.to(torch.int64)
+            
+        targets.append({"labels": labels, "masks": masks})
+    return targets
 
 
-def compute_dice(pred, target, num_classes, ignore_index=255):
-    """Compute Dice score per class."""
-    pred = pred.view(-1)
-    target = target.view(-1)
-    
-    mask = target != ignore_index
-    pred = pred[mask]
-    target = target[mask]
-    
-    dices = []
-    for cls in range(num_classes):
-        pred_cls = pred == cls
-        target_cls = target == cls
-        
-        intersection = (pred_cls & target_cls).sum().float()
-        total = pred_cls.sum() + target_cls.sum()
-        
-        if total > 0:
-            dices.append((2 * intersection / total).item())
-        else:
-            dices.append(float('nan'))
-    
-    return dices
-
-
-class Trainer:
-
-
+class MultiTaskTrainer:
     def __init__(
         self,
-        model,
-        criterion,
-        flood_train_loader,
-        burn_train_loader,
-        lulc_train_loader,
-        flood_val_loader,
-        burn_val_loader,
-        lulc_val_loader,
-        device,
-        epochs=100,
-        lr=1e-4,
-        weight_decay=0.05,
-        output_dir="./checkpoints",
-        amp=True,
-        task_schedule=None,
-        num_classes_per_task=None,
+        model: nn.Module,
+        datamodule,
+        tasks_config: Dict[str, Dict],
+        train_config: Dict[str, Any],
+        device: str = "cuda",
+        save_dir: str = "./checkpoints",
+        seed: int = 42,
     ):
+        # 1. Deterministic Seed
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
         self.model = model.to(device)
-        self.criterion = criterion
-
-        # Store dataloaders per task
-        self.flood_train_loader = flood_train_loader
-        self.burn_train_loader = burn_train_loader
-        self.lulc_train_loader = lulc_train_loader
-
-        self.flood_val_loader = flood_val_loader
-        self.burn_val_loader = burn_val_loader
-        self.lulc_val_loader = lulc_val_loader
-
-        # Number of classes per task
-        self.num_classes = num_classes_per_task or {
-            "flood": 2,
-            "burn": 2,
-            "lulc": 7,
-        }
-        
-        # Task loaders map
-        self.val_loaders = {
-            "flood": flood_val_loader,
-            "burn": burn_val_loader,
-            "lulc": lulc_val_loader,
-        }
-        
-        self.train_loaders = {
-            "flood": flood_train_loader,
-            "burn": burn_train_loader,
-            "lulc": lulc_train_loader,
-        }
-
+        self.datamodule = datamodule
         self.device = device
-        self.epochs = epochs
+        
+        # Apply configurations
+        self.tasks_config = tasks_config
+        self.train_config = train_config
+        self.epochs = train_config["epochs"]
+        self.save_dir = save_dir
+        self.patience = train_config.get("patience", 15)
+        os.makedirs(save_dir, exist_ok=True)
 
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        self.use_amp = amp
-        self.scaler = GradScaler(enabled=amp)
-
-        self.optimizer = self.build_optimizer(lr, weight_decay)
-        self.scheduler = self.build_scheduler()
-
-        self.best_score = -1.0
-        self.start_epoch = 0
-
-        # Configurable task schedule
-        self.task_schedule = task_schedule or ["flood", "burn", "lulc"]
-
-    def build_optimizer(self, lr, weight_decay):
-        parameters = [p for p in self.model.parameters() if p.requires_grad]
-        return AdamW(parameters, lr=lr, weight_decay=weight_decay)
-
-    def build_scheduler(self):
-        return CosineAnnealingLR(self.optimizer, T_max=self.epochs)
-
-    def save_checkpoint(self, epoch, is_best=False, metrics=None):
-        checkpoint = {
-            "epoch": epoch,
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
-            "best_score": self.best_score,
-            "metrics": metrics,
-        }
-        latest = self.output_dir / "latest.pth"
-        torch.save(checkpoint, latest)
-        if is_best:
-            best = self.output_dir / "best.pth"
-            torch.save(checkpoint, best)
-
-    def load_checkpoint(self, path):
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model"])
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.scheduler.load_state_dict(checkpoint["scheduler"])
-        self.best_score = checkpoint["best_score"]
-        self.start_epoch = checkpoint["epoch"] + 1
-        print(f"Resumed from epoch {self.start_epoch}")
-
-    def forward_batch(self, batch, task):
-        images = batch["image"].to(self.device)
-
-        # Targets are already prepared by collate_fn
-        targets = []
-        for target in batch["targets"]:
-            targets.append({
-                "labels": target["labels"].to(self.device),
-                "masks": target["masks"].to(self.device),
-            })
-
-        with autocast(enabled=self.use_amp):
-            outputs = self.model(images, task=task)
-            loss_dict = self.criterion(outputs, targets)
-            total_loss = sum(loss_dict.values())
-
-        return total_loss, loss_dict, outputs
-
-    def train_one_epoch(self, epoch):
-        self.model.train()
-
-        epoch_steps = max(
-            len(self.flood_train_loader),
-            len(self.burn_train_loader),
-            len(self.lulc_train_loader),
+        # 2. Optimizer & AMP Scaler
+        self.optimizer = AdamW(
+            self.model.get_trainable_params(), 
+            lr=train_config["lr"], 
+            weight_decay=train_config.get("weight_decay", 0.05)
         )
+        self.scaler = GradScaler()
 
-        iters = {task: iter(loader) for task, loader in self.train_loaders.items()}
-        running_loss = 0.0
-        total_updates = 0
+        # 3. Loss Criteria Setup (Deep Supervision weights)
+        weight_dict = {"loss_ce": 2.0, "loss_mask": 5.0, "loss_dice": 5.0}
+        aux_weight_dict = {f"{k}_{i}": v for i in range(9) for k, v in weight_dict.items()}
+        weight_dict.update(aux_weight_dict)
 
-        progress = tqdm(range(epoch_steps), desc=f"Epoch {epoch}")
+        self.criteria = {}
+        matcher = HungarianMatcher()
+        for task, cfg in self.tasks_config.items():
+            self.criteria[task] = SetCriterion(
+                num_classes=cfg["num_classes"], 
+                matcher=matcher, 
+                weight_dict=weight_dict, 
+                losses=["labels", "masks"], 
+                eos_coef=0.1
+            ).to(device)
 
-        for step in progress:
-            for task in self.task_schedule:
-                try:
-                    batch = next(iters[task])
-                except StopIteration:
-                    iters[task] = iter(self.train_loaders[task])
-                    batch = next(iters[task])
+        # 4. Data Loaders & Schedulers
+        self.train_loader = self.datamodule.train_dataloader()
+        self.val_loaders = self.datamodule.val_dataloader()
+        
+        total_steps = self.epochs * len(self.train_loader)
+        warmup_steps = train_config.get("warmup_epochs", 5) * len(self.train_loader)
+        self.scheduler = get_warmup_cosine_scheduler(self.optimizer, warmup_steps, total_steps)
 
-                self.optimizer.zero_grad(set_to_none=True)
-                loss, loss_dict, _ = self.forward_batch(batch, task)
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.1)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+        # State tracking
+        self.start_epoch = 1
+        self.best_loss = float("inf")
+        self.epochs_without_improvement = 0
 
-                running_loss += loss.item()
-                total_updates += 1
-
-                progress.set_postfix(
-                    task=task,
-                    loss=f"{loss.item():.4f}",
-                    lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
-                )
-
-        return running_loss / total_updates
-
-    @torch.no_grad()
-    def validate_task(self, loader, task):
-        """Validate a single task with IoU and Dice metrics."""
-        self.model.eval()
-        
-        total_loss = 0.0
-        all_preds = []
-        all_targets = []
-        
-        for batch in tqdm(loader, desc=f"Val {task}"):
-            loss, _, outputs = self.forward_batch(batch, task)
-            total_loss += loss.item()
-            
-            # Get predictions
-            pred_masks = outputs["pred_masks"]
-            pred_logits = outputs["pred_logits"]
-            pred_classes = pred_logits.argmax(dim=-1)
-            
-            # Get ground truth
-            gt_masks = batch["mask"].to(self.device)
-            
-            # Convert predictions to semantic masks (simplified)
-            pred_semantic = pred_classes[:, :, None, None].expand(-1, -1, gt_masks.shape[-2], gt_masks.shape[-1])
-            
-            all_preds.append(pred_semantic.cpu())
-            all_targets.append(gt_masks.cpu())
-        
-        all_preds = torch.cat(all_preds, dim=0)
-        all_targets = torch.cat(all_targets, dim=0)
-        
-        # Compute metrics
-        num_classes = self.num_classes[task]
-        ious = compute_iou(all_preds, all_targets, num_classes)
-        dices = compute_dice(all_preds, all_targets, num_classes)
-        
-        # Compute means (ignoring NaN)
-        valid_ious = [x for x in ious if not (x != x)]  # filter NaN
-        valid_dices = [x for x in dices if not (x != x)]
-        
-        miou = sum(valid_ious) / len(valid_ious) if valid_ious else 0.0
-        mean_dice = sum(valid_dices) / len(valid_dices) if valid_dices else 0.0
-        
-        avg_loss = total_loss / len(loader)
-        
-        return {
-            "loss": avg_loss,
-            "miou": miou,
-            "dice": mean_dice,
-            "ious_per_class": ious,
-            "dices_per_class": dices,
+    def save_checkpoint(self, epoch: int, is_best: bool = False, filename: str = "latest.pth"):
+        """Full State Checkpointing"""
+        state = {
+            "epoch": epoch,
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "scheduler_state": self.scheduler.state_dict(),
+            "scaler_state": self.scaler.state_dict(),
+            "best_loss": self.best_loss,
         }
-
-    def validate(self):
-        """Validate all tasks."""
-        results = {}
+        torch.save(state, os.path.join(self.save_dir, filename))
+        if is_best:
+            torch.save(state, os.path.join(self.save_dir, "best.pth"))
         
-        for task in self.task_schedule:
-            loader = self.val_loaders[task]
-            results[task] = self.validate_task(loader, task)
+        if epoch % 10 == 0:
+            torch.save(state, os.path.join(self.save_dir, f"epoch_{epoch}.pth"))
+
+    def resume(self, checkpoint_path: str):
+        """Resume Support"""
+        print(f"Resuming from {checkpoint_path}...")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        self.scheduler.load_state_dict(checkpoint["scheduler_state"])
+        self.scaler.load_state_dict(checkpoint["scaler_state"])
+        self.start_epoch = checkpoint["epoch"] + 1
+        self.best_loss = checkpoint["best_loss"]
+
+    def train_epoch(self, epoch: int):
+        self.model.train() 
+        self.model.encoder.eval() # Keep encoder strictly frozen
+
+        metrics = defaultdict(float)
+        task_counts = defaultdict(int)
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.epochs} [Train]")
         
-        # Compute overall score (average of all task mIoUs)
-        overall_miou = sum(r["miou"] for r in results.values()) / len(results)
-        
-        return results, overall_miou
+        for step, (task, batch) in enumerate(pbar):
+            images = batch["image"].to(self.device)
+            semantic_masks = batch["mask"].to(self.device)
+            
+            # Use task-specific configs for target conversion
+            task_cfg = self.tasks_config[task]
+            targets = semantic_to_mask2former_targets(
+                semantic_masks, 
+                ignore_index=task_cfg.get("ignore_index", 255),
+                background_id=task_cfg.get("background_id", None)
+            )
+            
+            # Handle Optional Metadata
+            metadata = batch.get("metadata", None)
+            if metadata is not None and isinstance(metadata, dict):
+                metadata = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in metadata.items()}
 
-    def train(self):
-        print("\nStarting Training...\n")
+            self.optimizer.zero_grad()
 
-        for epoch in range(self.start_epoch, self.epochs):
-            start = time.time()
+            # Mixed Precision Forward Pass
+            with autocast():
+                outputs = self.model(images, task=task, metadata=metadata)
+                loss_dict = self.criteria[task](outputs, targets)
+                weight_dict = self.criteria[task].weight_dict
+                total_loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
-            train_loss = self.train_one_epoch(epoch)
-            results, overall_miou = self.validate()
-
+            # Mixed Precision Backward
+            self.scaler.scale(total_loss).backward()
+            
+            # Gradient Clipping
+            self.scaler.unscale_(self.optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             self.scheduler.step()
 
-            elapsed = time.time() - start
-
-            # Print per-task metrics
-            print(f"\nEpoch [{epoch+1}/{self.epochs}] - Time: {elapsed:.2f}s")
-            print("-" * 60)
+            # Detailed Logging
+            metrics[f"{task}_loss"] += total_loss.item()
+            metrics[f"{task}_ce"] += loss_dict.get("loss_ce", torch.tensor(0)).item()
+            metrics[f"{task}_mask"] += loss_dict.get("loss_mask", torch.tensor(0)).item()
+            task_counts[task] += 1
             
-            for task, metrics in results.items():
-                print(f"{task.upper():>8} | Loss: {metrics['loss']:.4f} | mIoU: {metrics['miou']:.4f} | Dice: {metrics['dice']:.4f}")
-            
-            print("-" * 60)
-            print(f"{'OVERALL':>8} | mIoU: {overall_miou:.4f}")
-            print()
+            pbar.set_postfix(
+                task=task, 
+                loss=f"{total_loss.item():.3f}", 
+                lr=f"{self.scheduler.get_last_lr()[0]:.2e}",
+                grad=f"{grad_norm:.2f}"
+            )
 
-            is_best = overall_miou > self.best_score
-            if is_best:
-                self.best_score = overall_miou
-
-            self.save_checkpoint(epoch, is_best=is_best, metrics=results)
-
-        print("\nTraining Complete.")
+        return {k: v / task_counts[k.split('_')[0]] for k, v in metrics.items()}
 
     @torch.no_grad()
-    def predict(self, images, task):
+    def validate(self):
+        """Runs validation and computes losses and metrics for each task."""
         self.model.eval()
-        images = images.to(self.device)
-        outputs = self.model(images, task=task)
-        return outputs
+        val_losses = {}
+        
+        for task, loader in self.val_loaders.items():
+            task_cfg = self.tasks_config[task]
+            task_loss = 0.0
+            
+            # Initialize our SegmentationMetrics for this specific task
+            metric_tracker = SegmentationMetrics(
+                num_classes=task_cfg["num_classes"], 
+                ignore_index=task_cfg.get("ignore_index", 255)
+            )
+            
+            pbar = tqdm(loader, desc=f"Validation [{task}]", leave=False)
+            
+            for batch in pbar:
+                images = batch["image"].to(self.device)
+                semantic_masks = batch["mask"].to(self.device)
+                
+                targets = semantic_to_mask2former_targets(
+                    semantic_masks, 
+                    ignore_index=task_cfg.get("ignore_index", 255),
+                    background_id=task_cfg.get("background_id", None)
+                )
+
+                metadata = batch.get("metadata", None)
+                if metadata is not None and isinstance(metadata, dict):
+                    metadata = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in metadata.items()}
+
+                with autocast():
+                    outputs = self.model(images, task=task, metadata=metadata)
+                    loss_dict = self.criteria[task](outputs, targets)
+                    weight_dict = self.criteria[task].weight_dict
+                    total_loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+                
+                task_loss += total_loss.item()
+                
+                # --- Quick Semantic Mask Recovery for Metrics ---
+                # Mask2Former outputs masks of shape [B, Q, H, W] and class logits [B, Q, C+1]
+                # We do a quick argmax over classes, then multiply to get a dense semantic map
+                pred_masks = outputs["pred_masks"]
+                pred_logits = outputs["pred_logits"]
+                
+                # Convert to probability and find most likely class per query
+                prob = pred_logits.softmax(-1)
+                scores, labels = prob.max(-1)
+                
+                # Simplified inference merging for metrics evaluation
+                pred_semantic = torch.zeros_like(semantic_masks)
+                for b in range(images.size(0)):
+                    # Get masks for this image, sigmoid them
+                    b_masks = pred_masks[b].sigmoid()
+                    # Filter out the 'no object' class predictions (the last index)
+                    keep = labels[b] != self.criteria[task].num_classes
+                    if keep.any():
+                        b_masks = b_masks[keep]
+                        b_labels = labels[b][keep]
+                        
+                        # Assign each pixel to the class with the highest mask probability
+                        # (This is a simplified metric inference approximation)
+                        mask_probs, mask_idx = b_masks.max(0)
+                        pred_semantic[b] = b_labels[mask_idx]
+                
+                metric_tracker.update(pred_semantic, semantic_masks)
+                
+            val_losses[task] = task_loss / len(loader)
+            
+            # Print task-specific metrics cleanly
+            results = metric_tracker.compute()
+            print(f"\n[{task}] Val Loss: {val_losses[task]:.4f} | mIoU: {results['miou']:.4f} | mAcc: {results['mean_accuracy']:.4f}")
+            
+        return val_losses
+
+    def fit(self, resume_path: Optional[str] = None):
+        print(f"Starting Multi-Task Training on {self.device}")
+        if resume_path:
+            self.resume(resume_path)
+            
+        for epoch in range(self.start_epoch, self.epochs + 1):
+            train_metrics = self.train_epoch(epoch)
+            val_losses = self.validate() 
+            
+            avg_val_loss = sum(val_losses.values()) / len(val_losses)
+            
+            print(f"\n--- Epoch {epoch} Summary ---")
+            for task in val_losses.keys():
+                print(f"Task '{task}': Train Loss = {train_metrics[f'{task}_loss']:.4f}")
+            print(f"Average Val Loss: {avg_val_loss:.4f}\n")
+
+            is_best = avg_val_loss < self.best_loss
+            if is_best:
+                self.best_loss = avg_val_loss
+                self.epochs_without_improvement = 0
+            else:
+                self.epochs_without_improvement += 1
+
+            self.save_checkpoint(epoch, is_best=is_best, filename="latest.pth")
+
+            if self.epochs_without_improvement >= self.patience:
+                print(f"Early stopping triggered after {epoch} epochs.")
+                break

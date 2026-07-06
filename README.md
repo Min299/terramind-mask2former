@@ -1,1 +1,1 @@
-# terramind-mask2former
+# TerraMask2Former

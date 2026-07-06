@@ -2,7 +2,8 @@
 MultiScaleMaskedTransformerDecoder for TerraMind-Mask2Former.
 
 This is a clean PyTorch implementation of the Mask2Former transformer decoder,
-adapted from the original Detectron2 implementation.
+adapted from the original Detectron2 implementation and optimized for GELU-based
+architectures with efficient attention mask broadcasting.
 """
 
 from typing import Dict, List, Optional
@@ -14,15 +15,22 @@ from torch import Tensor
 from .position_encoding import PositionEmbeddingSine
 
 
+def _get_activation_fn(activation: str):
+    if activation == "relu":
+        return F.relu
+    if activation == "gelu":
+        return F.gelu
+    raise RuntimeError(f"activation should be relu/gelu, not {activation}.")
+
+
 class SelfAttentionLayer(nn.Module):
     """Self-attention layer for decoder."""
 
-    def __init__(self, d_model, nhead, dropout=0.0, activation="relu", normalize_before=False):
+    def __init__(self, d_model, nhead, dropout=0.0, normalize_before=False):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
         self._reset_parameters()
 
@@ -57,12 +65,11 @@ class SelfAttentionLayer(nn.Module):
 class CrossAttentionLayer(nn.Module):
     """Cross-attention layer for decoder."""
 
-    def __init__(self, d_model, nhead, dropout=0.0, activation="relu", normalize_before=False):
+    def __init__(self, d_model, nhead, dropout=0.0, normalize_before=False):
         super().__init__()
         self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
         self._reset_parameters()
 
@@ -103,7 +110,7 @@ class CrossAttentionLayer(nn.Module):
 class FFNLayer(nn.Module):
     """Feed-forward network layer."""
 
-    def __init__(self, d_model, dim_feedforward=2048, dropout=0.0, activation="relu", normalize_before=False):
+    def __init__(self, d_model, dim_feedforward=2048, dropout=0.0, activation="gelu", normalize_before=False):
         super().__init__()
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
@@ -147,18 +154,8 @@ class MLP(nn.Module):
 
     def forward(self, x):
         for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+            x = F.gelu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
-
-
-def _get_activation_fn(activation):
-    if activation == "relu":
-        return F.relu
-    if activation == "gelu":
-        return F.gelu
-    if activation == "glu":
-        return F.glu
-    raise RuntimeError(f"activation should be relu/gelu, not {activation}.")
 
 
 class MultiScaleMaskedTransformerDecoder(nn.Module):
@@ -179,7 +176,8 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         dec_layers: int = 9,
         pre_norm: bool = False,
         mask_dim: int = 256,
-        enforce_input_project: bool = True,
+        enforce_input_project: bool = False,  # Changed default to False for Neck compatibility
+        activation: str = "gelu",  
     ):
         super().__init__()
 
@@ -210,31 +208,57 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
                 CrossAttentionLayer(d_model=hidden_dim, nhead=nheads, dropout=0.0, normalize_before=pre_norm)
             )
             self.transformer_ffn_layers.append(
-                FFNLayer(d_model=hidden_dim, dim_feedforward=dim_feedforward, dropout=0.0, normalize_before=pre_norm)
+                FFNLayer(d_model=hidden_dim, dim_feedforward=dim_feedforward, dropout=0.0, activation=activation, normalize_before=pre_norm)
             )
 
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
-        # Learnable query features
+        # Learnable query features and position encodings
         self.query_feat = nn.Embedding(num_queries, hidden_dim)
-        # Learnable query positional encoding
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
         # Level embeddings for multi-scale features
         self.num_feature_levels = 3
         self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
 
-        # Input projections
+        # Input projections (Optimized with nn.Identity)
         self.input_proj = nn.ModuleList()
         for _ in range(self.num_feature_levels):
             if in_channels != hidden_dim or enforce_input_project:
                 self.input_proj.append(nn.Conv2d(in_channels, hidden_dim, kernel_size=1))
             else:
-                self.input_proj.append(nn.Sequential())
+                self.input_proj.append(nn.Identity())
 
         # Output heads
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)  # +1 for no-object class
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        """Explicitly initialize parameters for stable early-epoch convergence."""
+        # Query/Level Embeddings (Normal distribution matches standard Transformer init)
+        nn.init.normal_(self.query_feat.weight)
+        nn.init.normal_(self.query_embed.weight)
+        nn.init.normal_(self.level_embed.weight)
+
+        # Class head initialization
+        nn.init.xavier_uniform_(self.class_embed.weight)
+        if self.class_embed.bias is not None:
+            nn.init.constant_(self.class_embed.bias, 0)
+            
+        # Mask head (MLP) initialization
+        for layer in self.mask_embed.layers:
+            nn.init.xavier_uniform_(layer.weight)
+            if layer.bias is not None:
+                nn.init.constant_(layer.bias, 0)
+                
+        # Projections (if enforce_input_project was True)
+        for proj in self.input_proj:
+            if isinstance(proj, nn.Conv2d):
+                nn.init.xavier_uniform_(proj.weight)
+                if proj.bias is not None:
+                    nn.init.constant_(proj.bias, 0)
 
     def forward(self, x: List[torch.Tensor], mask_features: torch.Tensor):
         """
@@ -258,7 +282,9 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         for i in range(self.num_feature_levels):
             size_list.append(x[i].shape[-2:])
-            pos.append(self.pe_layer(x[i], None).flatten(2))
+            pos.append(self.pe_layer(x[i]).flatten(2))
+            
+            # input_proj acts as nn.Identity if enforce_input_project=False
             src.append(self.input_proj[i](x[i]).flatten(2) + self.level_embed.weight[i][None, :, None])
             
             # Convert to HWxNxC format
@@ -267,9 +293,9 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         _, bs, _ = src[0].shape
 
-        # Initialize queries
-        query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
-        output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
+        # Initialize queries (Optimized memory using .expand() instead of .repeat())
+        query_embed = self.query_embed.weight.unsqueeze(1).expand(-1, bs, -1)
+        output = self.query_feat.weight.unsqueeze(1).expand(-1, bs, -1)
 
         predictions_class = []
         predictions_mask = []
@@ -329,8 +355,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         # Create attention mask for masking
         attn_mask = F.interpolate(outputs_mask, size=attn_mask_target_size, mode="bilinear", align_corners=False)
-        attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
-        attn_mask = attn_mask.detach()
+        attn_mask = (attn_mask.flatten(2).unsqueeze(1).expand(-1, self.num_heads, -1, -1).flatten(0, 1) < 0).detach()
 
         return outputs_class, outputs_mask, attn_mask
 
