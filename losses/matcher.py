@@ -21,7 +21,6 @@ from typing import Dict, List, Tuple
 
 import torch
 from torch import nn
-from torch.cuda.amp import autocast
 from scipy.optimize import linear_sum_assignment
 
 from losses import (
@@ -48,11 +47,9 @@ class HungarianMatcher(nn.Module):
     ):
         super().__init__()
 
-        assert (
-            cost_class != 0
-            or cost_mask != 0
-            or cost_dice != 0
-        ), "All matching costs cannot be zero."
+        # Replaced assert with safe ValueError for runtime robustness
+        if cost_class == 0 and cost_mask == 0 and cost_dice == 0:
+            raise ValueError("All matching costs cannot be zero.")
 
         self.cost_class = cost_class
         self.cost_mask = cost_mask
@@ -71,129 +68,79 @@ class HungarianMatcher(nn.Module):
         """
 
         bs, num_queries = outputs["pred_logits"].shape[:2]
-
         indices = []
 
         for b in range(bs):
-
-            #
-            # --------------------------------------------------
-            # Classification Cost
-            # --------------------------------------------------
-            #
-
-            out_prob = outputs["pred_logits"][b].softmax(-1)
-
             tgt_labels = targets[b]["labels"]
+            
+            # Short-circuit if there are no ground-truth targets in this image.
+            # Prevents CUDA errors from pushing empty tensors into einsum/PointRend.
+            if len(tgt_labels) == 0:
+                indices.append((
+                    torch.empty(0, dtype=torch.int64, device=outputs["pred_logits"].device), 
+                    torch.empty(0, dtype=torch.int64, device=outputs["pred_logits"].device)
+                ))
+                continue
 
+            # 1. Classification Cost
+            out_prob = outputs["pred_logits"][b].softmax(-1)
             cost_class = -out_prob[:, tgt_labels]
 
-            #
-            # --------------------------------------------------
-            # Mask Cost
-            # --------------------------------------------------
-            #
-
+            # 2. Mask Cost Pre-processing
             pred_masks = outputs["pred_masks"][b]
             gt_masks = targets[b]["masks"].to(pred_masks)
 
             pred_masks = pred_masks[:, None]
             gt_masks = gt_masks[:, None]
 
-            #
-            # Sample SAME random points from both prediction
-            # and target masks (official Mask2Former)
-            #
-
-            point_coords = torch.rand(
-                1,
-                self.num_points,
-                2,
-                device=pred_masks.device,
-            )
+            # PointRend sampling to reduce memory footprint from O(H*W) to O(num_points)
+            point_coords = torch.rand(1, self.num_points, 2, device=pred_masks.device)
 
             sampled_gt = sample_points(
-                gt_masks,
-                point_coords.repeat(
-                    gt_masks.shape[0],
-                    1,
-                    1,
-                ),
-                align_corners=False,
+                gt_masks, 
+                point_coords.repeat(gt_masks.shape[0], 1, 1), 
+                align_corners=False
             ).squeeze(1)
-
+            
             sampled_pred = sample_points(
-                pred_masks,
-                point_coords.repeat(
-                    pred_masks.shape[0],
-                    1,
-                    1,
-                ),
-                align_corners=False,
+                pred_masks, 
+                point_coords.repeat(pred_masks.shape[0], 1, 1), 
+                align_corners=False
             ).squeeze(1)
 
-            #
-            # --------------------------------------------------
-            # Pairwise Costs
-            # --------------------------------------------------
-            #
-
-            with autocast(enabled=False):
-
+            # 3. Pairwise Costs 
+            # Explicitly disable autocast for numerical stability in the cost matrix
+            device_type = "cuda" if pred_masks.is_cuda else "cpu"
+            with torch.autocast(device_type=device_type, enabled=False):
                 sampled_pred = sampled_pred.float()
                 sampled_gt = sampled_gt.float()
 
-                cost_mask = batch_sigmoid_ce_cost(
-                    sampled_pred,
-                    sampled_gt,
-                )
+                cost_mask = batch_sigmoid_ce_cost(sampled_pred, sampled_gt)
+                cost_dice = batch_dice_cost(sampled_pred, sampled_gt)
 
-                cost_dice = batch_dice_cost(
-                    sampled_pred,
-                    sampled_gt,
-                )
-
-            #
-            # --------------------------------------------------
-            # Final Cost Matrix
-            # --------------------------------------------------
-            #
-
+            # 4. Final Cost Matrix & Hungarian Assignment
             cost = (
                 self.cost_class * cost_class
                 + self.cost_mask * cost_mask
                 + self.cost_dice * cost_dice
             )
 
-            cost = cost.reshape(
-                num_queries,
-                -1,
-            ).cpu()
+            # Move to CPU because scipy linear_sum_assignment does not support CUDA tensors
+            cost = cost.reshape(num_queries, -1).cpu()
+            pred_ind, tgt_ind = linear_sum_assignment(cost)
 
-            pred_ind, tgt_ind = linear_sum_assignment(
-                cost
-            )
-
-            indices.append(
-                (
-                    torch.as_tensor(
-                        pred_ind,
-                        dtype=torch.int64,
-                    ),
-                    torch.as_tensor(
-                        tgt_ind,
-                        dtype=torch.int64,
-                    ),
-                )
-            )
+            indices.append((
+                torch.as_tensor(pred_ind, dtype=torch.int64),
+                torch.as_tensor(tgt_ind, dtype=torch.int64),
+            ))
 
         return indices
 
     @torch.no_grad()
     def forward(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        targets: List[Dict[str, torch.Tensor]],
+        self, 
+        outputs: Dict[str, torch.Tensor], 
+        targets: List[Dict[str, torch.Tensor]]
     ):
         """
         Returns
@@ -205,14 +152,9 @@ class HungarianMatcher(nn.Module):
             )
         ]
         """
-
-        return self.memory_efficient_forward(
-            outputs,
-            targets,
-        )
+        return self.memory_efficient_forward(outputs, targets)
 
     def __repr__(self):
-
         return (
             f"{self.__class__.__name__}(\n"
             f"  cost_class={self.cost_class},\n"

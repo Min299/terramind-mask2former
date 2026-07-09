@@ -16,19 +16,25 @@ import torch
 from torch.cuda.amp import autocast
 from tqdm import tqdm
 
-from multitask_datamodule import MultiTaskDataModule
-from collate import MultiTaskCollate
-from criterion import SetCriterion
-from matcher import HungarianMatcher
-from metrics import SegmentationMetrics
-from trainer import semantic_to_mask2former_targets
-from inference_utils import build_model_from_config, load_checkpoint, postprocess_mask2former_outputs
+from data.multitask_datamodule import MultiTaskDataModule
+from data.collate import MultiTaskCollate
+from losses.criterion import SetCriterion
+from losses.matcher import HungarianMatcher
+from engine.metrics import SegmentationMetrics
+
+# Import the centralized utilities
+from engine.inference_utils import (
+    build_model, 
+    load_checkpoint, 
+    postprocess_mask2former_outputs,
+    semantic_to_mask2former_targets
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Test TerraMind Mask2Former")
-    parser.add_argument("--config", type=str, required=True, help="Path to training_config.yaml")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to best.pth")
+    parser.add_argument("--config", type=str, required=True, help="Path to config.yaml (from checkpoint dir)")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to best_model.pth")
     parser.add_argument("--save_dir", type=str, default="./results", help="Where to save eval results")
     parser.add_argument("--batch_size", type=int, default=None, help="Optional override for batch size")
     return parser.parse_args()
@@ -37,6 +43,7 @@ def parse_args():
 def load_configuration(config_path: str):
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
+    # Extract structural configs (TRAIN is ignored for testing)
     return config["MODEL"], config["TASKS"], config.get("MATCHER", {}), config.get("CRITERION", {})
 
 
@@ -60,17 +67,25 @@ def evaluate_task(model, loader, criterion, metric_tracker, task_name, device):
     task_loss = 0.0
     steps = 0
     
+    use_amp = "cuda" in device
+    device_type = "cuda" if use_amp else "cpu"
+    
     pbar = tqdm(loader, desc=f"Evaluating [{task_name}]", leave=False)
     for batch in pbar:
         images = batch["image"].to(device)
         semantic_masks = batch["mask"].to(device)
         
         ignore_idx = metric_tracker.ignore_index
-        targets = semantic_to_mask2former_targets(semantic_masks, ignore_index=ignore_idx)
+        # Use centralized target conversion
+        targets = semantic_to_mask2former_targets(
+            semantic_masks, 
+            num_classes=metric_tracker.num_classes,
+            ignore_index=ignore_idx,
+            background_id=None # Optionally extract from config if needed
+        )
 
-        # FIX: Added AMP Context Manager for evaluation
-        with autocast():
-            # Metadata arg safely removed
+        # Device-aware AMP Context Manager
+        with torch.autocast(device_type=device_type, enabled=use_amp):
             outputs = model(images, task=task_name)
             
             loss_dict = criterion(outputs, targets)
@@ -139,14 +154,25 @@ def main():
     MODEL_CONFIG, TASKS, MATCHER_CONFIG, CRITERION_CONFIG = load_configuration(args.config)
 
     logger.info("Building Model & Loading Checkpoint...")
-    model = build_model_from_config(MODEL_CONFIG, TASKS)
+    model = build_model(MODEL_CONFIG, TASKS) # Passes dicts to the builder
     model = load_checkpoint(model, args.checkpoint, device)
 
     logger.info("Initializing DataModules...")
     datamodule = build_datamodule(TASKS, args.batch_size)
     test_loaders = datamodule.test_dataloader()
 
-    # Reconstruct Criteria exactly using the config from training
+    # ---------------------------------------------------------
+    # FIX: Reconstruct the full weight_dict including deep supervision
+    # ---------------------------------------------------------
+    weight_dict = {"loss_ce": 2.0, "loss_mask": 5.0, "loss_dice": 5.0}
+    dec_layers = MODEL_CONFIG.get("transformer_decoder", {}).get("dec_layers", 9)
+    aux_weight_dict = {f"{k}_{i}": v for i in range(dec_layers) for k, v in weight_dict.items()}
+    weight_dict.update(aux_weight_dict)
+    
+    CRITERION_CONFIG["weight_dict"] = weight_dict
+    CRITERION_CONFIG["losses"] = CRITERION_CONFIG.get("losses", ["labels", "masks"])
+    CRITERION_CONFIG["eos_coef"] = CRITERION_CONFIG.get("eos_coef", 0.1)
+
     criteria = {}
     for task, cfg in TASKS.items():
         criteria[task] = SetCriterion(

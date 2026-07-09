@@ -261,88 +261,101 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
                     nn.init.constant_(proj.bias, 0)
 
     def forward(self, x: List[torch.Tensor], mask_features: torch.Tensor):
-        """
-        Forward pass.
-        
-        Args:
-            x: List of multi-scale features [B, C, H, W]
-            mask_features: Final mask features [B, mask_dim, H, W]
-        
-        Returns:
-            Dictionary with:
-            - pred_logits: Class predictions [B, num_queries, num_classes + 1]
-            - pred_masks: Mask logits [B, num_queries, H, W]
-            - aux_outputs: List of auxiliary outputs
-        """
-        assert len(x) == self.num_feature_levels
-        
-        src = []
-        pos = []
-        size_list = []
-
-        for i in range(self.num_feature_levels):
-            size_list.append(x[i].shape[-2:])
-            pos.append(self.pe_layer(x[i]).flatten(2))
+            """
+            Forward pass.
             
-            # input_proj acts as nn.Identity if enforce_input_project=False
-            src.append(self.input_proj[i](x[i]).flatten(2) + self.level_embed.weight[i][None, :, None])
+            Args:
+                x: List of multi-scale features [B, C, H, W]
+                mask_features: Final mask features [B, mask_dim, H, W]
             
-            # Convert to HWxNxC format
-            pos[-1] = pos[-1].permute(2, 0, 1)
-            src[-1] = src[-1].permute(2, 0, 1)
-
-        _, bs, _ = src[0].shape
-
-        # Initialize queries (Optimized memory using .expand() instead of .repeat())
-        query_embed = self.query_embed.weight.unsqueeze(1).expand(-1, bs, -1)
-        output = self.query_feat.weight.unsqueeze(1).expand(-1, bs, -1)
-
-        predictions_class = []
-        predictions_mask = []
-
-        # Initial prediction
-        outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
-            output, mask_features, attn_mask_target_size=size_list[0]
-        )
-        predictions_class.append(outputs_class)
-        predictions_mask.append(outputs_mask)
-
-        # Decoder layers
-        for i in range(self.num_layers):
-            level_index = i % self.num_feature_levels
-            attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
+            Returns:
+                Dictionary with:
+                - pred_logits: Class predictions [B, num_queries, num_classes + 1]
+                - pred_masks: Mask logits [B, num_queries, H, W]
+                - aux_outputs: List of auxiliary outputs
+            """
+            if len(x) != self.num_feature_levels:
+                raise ValueError(f"Expected {self.num_feature_levels} multi-scale features, got {len(x)}")
             
-            # Cross-attention
-            output = self.transformer_cross_attention_layers[i](
-                output, src[level_index],
-                memory_mask=attn_mask,
-                memory_key_padding_mask=None,
-                pos=pos[level_index], query_pos=query_embed
-            )
+            src = []
+            pos = []
+            size_list = []
 
-            # Self-attention
-            output = self.transformer_self_attention_layers[i](
-                output, tgt_mask=None,
-                tgt_key_padding_mask=None,
-                query_pos=query_embed
-            )
-            
-            # FFN
-            output = self.transformer_ffn_layers[i](output)
+            for i in range(self.num_feature_levels):
+                size_list.append(x[i].shape[-2:])
+                pos.append(self.pe_layer(x[i]).flatten(2))
+                
+                # input_proj acts as nn.Identity if enforce_input_project=False
+                # Replaced [None, :, None] with unsqueeze for better PyTorch stylistic clarity
+                lvl_embed = self.level_embed.weight[i].unsqueeze(0).unsqueeze(-1)
+                src.append(self.input_proj[i](x[i]).flatten(2) + lvl_embed)
+                
+                # Convert to HWxNxC format
+                pos[-1] = pos[-1].permute(2, 0, 1)
+                src[-1] = src[-1].permute(2, 0, 1)
 
-            # Prediction heads
+            _, bs, _ = src[0].shape
+
+            # Initialize queries (Optimized memory using .expand() instead of .repeat())
+            query_embed = self.query_embed.weight.unsqueeze(1).expand(-1, bs, -1)
+            output = self.query_feat.weight.unsqueeze(1).expand(-1, bs, -1)
+
+            predictions_class = []
+            predictions_mask = []
+
+            # Initial prediction (Uses lowest resolution grid size)
             outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
-                output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels]
+                output, mask_features, attn_mask_target_size=size_list[0]
             )
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
 
-        out = {
-            'pred_logits': predictions_class[-1],
-            'pred_masks': predictions_mask[-1],
-            'aux_outputs': self._set_aux_loss(predictions_class[:-1], predictions_mask[:-1])
-        }
-        return out
+            # Decoder layers
+            for i in range(self.num_layers):
+                level_index = i % self.num_feature_levels
+                
+                # NaN-prevention hack: if mask is entirely background, attend to everything
+                attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
+                
+                # Cross-attention (Queries extract features from the image)
+                output = self.transformer_cross_attention_layers[i](
+                    output, src[level_index],
+                    memory_mask=attn_mask,
+                    memory_key_padding_mask=None,
+                    pos=pos[level_index], query_pos=query_embed
+                )
+
+                # Self-attention (Queries communicate with each other)
+                output = self.transformer_self_attention_layers[i](
+                    output, tgt_mask=None,
+                    tgt_key_padding_mask=None,
+                    query_pos=query_embed
+                )
+                
+                # FFN
+                output = self.transformer_ffn_layers[i](output)
+
+                # Prediction heads
+                outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
+                    output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels]
+                )
+                predictions_class.append(outputs_class)
+                predictions_mask.append(outputs_mask)
+
+            out = {
+                'pred_logits': predictions_class[-1],
+                'pred_masks': predictions_mask[-1],
+                'aux_outputs': self._set_aux_loss(predictions_class[:-1], predictions_mask[:-1])
+            }
+            
+            # Single fast output shape validation (Omits heavy checks inside the forward loop)
+            if out['pred_logits'].shape[-1] != self.num_classes + 1:
+                raise ValueError(
+                    f"Expected {self.num_classes + 1} output classes "
+                    f"(including 'no object'), got {out['pred_logits'].shape[-1]}"
+                )
+                
+            return out
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size):
         """Compute class predictions and mask logits."""

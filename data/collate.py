@@ -34,19 +34,29 @@ class MultiTaskCollate:
             masks.append(m)
         semantic_masks = torch.stack(masks, dim=0)
         
-        metadata = None
-        if "metadata" in batch[0] and isinstance(batch[0]["metadata"], dict):
-            expected_keys = set(batch[0]["metadata"].keys())
+# 3. Safely extract metadata (Packs all TerraTorch extra keys into a metadata dict)
+        metadata = {}
+        # Find any keys that aren't the standard 'image' or 'mask'
+        extra_keys = set(batch[0].keys()) - {"image", "mask"}
+        
+        if extra_keys:
+            # Verify all items in batch have the exact same keys
             for item in batch:
-                if set(item.get("metadata", {}).keys()) != expected_keys:
-                    raise KeyError(f"Metadata key mismatch. Expected {expected_keys}")
+                if set(item.keys()) - {"image", "mask"} != extra_keys:
+                    raise KeyError(f"Batch key mismatch. Expected extra keys {extra_keys}")
                     
-            metadata = {}
-            for key in expected_keys:
-                val = batch[0]["metadata"][key]
+            for key in extra_keys:
+                val = batch[0][key]
                 if torch.is_tensor(val):
-                    metadata[key] = torch.stack([item["metadata"][key] for item in batch], dim=0)
+                    metadata[key] = torch.stack([item[key] for item in batch], dim=0)
                 else:
-                    metadata[key] = [item["metadata"][key] for item in batch]
+                    metadata[key] = [item[key] for item in batch]
+        
+        if not metadata:
+            metadata = None
                 
-        return {"image": images, "mask": semantic_masks, "metadata": metadata}
+        return {
+            "image": images,
+            "mask": semantic_masks,
+            "metadata": metadata,  # Now correctly contains location_coords & temporal_coords
+        }

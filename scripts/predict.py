@@ -12,7 +12,6 @@ import argparse
 import yaml
 import torch
 import numpy as np
-from torch.cuda.amp import autocast
 from PIL import Image
 
 try:
@@ -22,18 +21,40 @@ except ImportError:
     HAS_RASTERIO = False
 
 import torchvision.transforms.functional as TF
-from inference_utils import build_model_from_config, load_checkpoint, postprocess_mask2former_outputs
+
+# FIX 1: Updated imports to match inference_utils.py
+from engine.inference_utils import build_model, load_checkpoint, postprocess_mask2former_outputs
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Predict with TerraMind Mask2Former")
-    parser.add_argument("--config", type=str, required=True, help="Path to training_config.yaml")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to best.pth")
+    parser.add_argument("--config", type=str, required=True, help="Path to config.yaml (from checkpoint dir)")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to best_model.pth")
     parser.add_argument("--task", type=str, required=True, help="Task to predict (e.g., 'flood')")
     parser.add_argument("--input", type=str, required=True, help="Path to image or folder of images")
     parser.add_argument("--output", type=str, required=True, help="Directory to save predictions")
     parser.add_argument("--overlay", action="store_true", help="Save blended overlay images")
     return parser.parse_args()
+
+
+def validate_prediction_config(task_config: dict):
+    """Fails fast if visualization metadata is invalid."""
+    if "palette" not in task_config:
+        raise ValueError("Config missing 'palette' for visualization.")
+        
+    palette = task_config["palette"]
+    num_classes = task_config["num_classes"]
+    
+    for c in range(num_classes):
+        if c not in palette:
+            raise ValueError(f"Palette missing color mapping for class index {c}")
+        if len(palette[c]) != 3:
+            raise ValueError(f"Palette color for class {c} must be an RGB triplet.")
+            
+    if "rgb_bands" in task_config:
+        rgb_bands = task_config["rgb_bands"]
+        if len(set(rgb_bands)) != len(rgb_bands):
+            raise ValueError(f"RGB bands must be unique, got {rgb_bands}")
 
 
 def load_image(image_path: str, task_config: dict):
@@ -46,38 +67,42 @@ def load_image(image_path: str, task_config: dict):
         with rasterio.open(image_path) as src:
             img_array = src.read()  # [C, H, W]
             
-        # 1. GeoTIFF scaling (e.g., uint16 -> float32)
         scale_factor = task_config.get("scale_factor", 1.0)
         tensor = torch.from_numpy(img_array.astype(np.float32)) / scale_factor
         
-        # 2. Extract specific RGB bands for visualization
         rgb_bands = task_config.get("rgb_bands", [0, 1, 2])
+        if max(rgb_bands) >= img_array.shape[0]:
+            raise IndexError(f"RGB band index {max(rgb_bands)} exceeds image channels {img_array.shape[0]}")
+            
         vis_array = np.transpose(img_array[rgb_bands, :, :], (1, 2, 0))
-        
         if vis_array.max() > 255:
             vis_array = (vis_array / vis_array.max() * 255).astype(np.uint8)
         img_pil = Image.fromarray(vis_array.astype(np.uint8))
         
     else:
         img_pil = Image.open(image_path).convert("RGB")
-        tensor = TF.to_tensor(img_pil)  # Handles 0-255 -> 0.0-1.0
+        tensor = TF.to_tensor(img_pil)  
         
     return img_pil, tensor
 
 
 def preprocess(image_tensor: torch.Tensor, device: str, task_config: dict):
-    """
-    CRITICAL: This preprocessing must exactly mirror the training transformations.
-    Throws NotImplementedError if norm config is missing to prevent silent bad inference.
-    """
-    if "mean" in task_config and "std" in task_config:
+    """Configurable normalization handling. (Duplicate removed)"""
+    image_tensor = image_tensor.float()
+    
+    if task_config.get("normalize", False):
+        if "mean" not in task_config or "std" not in task_config:
+            raise ValueError("Predict config requires 'mean' and 'std' when normalize=True.")
+            
+        # Validate channel lengths
+        channels = image_tensor.shape[0]
+        if len(task_config["mean"]) != channels or len(task_config["std"]) != channels:
+            raise ValueError(f"Mean/Std lengths must match image channels ({channels}).")
+            
         mean = torch.tensor(task_config["mean"]).view(-1, 1, 1)
         std = torch.tensor(task_config["std"]).view(-1, 1, 1)
         image_tensor = (image_tensor - mean) / std
-    else:
-        # If your training pipeline used normalization, you MUST define it in your YAML.
-        print("WARNING: 'mean' and 'std' not found in config. Predicting on un-normalized tensor.")
-    
+        
     return image_tensor.unsqueeze(0).to(device)
 
 
@@ -110,7 +135,7 @@ def save_prediction(semantic_mask: np.ndarray, img: Image.Image, output_path: st
     
     np.save(f"{base_name}_raw.npy", semantic_mask)
     
-    colored_mask = colorize_mask(semantic_mask, task_config)
+    colored_mask = colorize_mask(semantic_mask.astype(np.uint8), task_config)
     colored_mask.save(f"{base_name}_mask.png")
     
     if save_overlay:
@@ -123,13 +148,17 @@ def predict_single_image(model, image_path, task, task_config, output_dir, devic
     img_pil, img_tensor = load_image(image_path, task_config)
     img_input = preprocess(img_tensor, device, task_config)
     
-    with autocast():
-        # Forward pass (metadata removed)
+    use_amp = "cuda" in device
+    device_type = "cuda" if use_amp else "cpu"
+    
+    with torch.autocast(device_type=device_type, enabled=use_amp):
         outputs = model(img_input, task=task)
     
     target_size = img_input.shape[-2:]
     semantic_map = postprocess_mask2former_outputs(outputs["pred_logits"], outputs["pred_masks"], target_size)
-    semantic_array = semantic_map.squeeze(0).cpu().numpy().astype(np.uint8)
+    
+    assert semantic_map.dtype == torch.long
+    semantic_array = semantic_map.squeeze(0).cpu().numpy()
     
     filename = os.path.basename(image_path)
     output_path = os.path.join(output_dir, filename)
@@ -143,9 +172,7 @@ def predict_folder(model, input_folder, task, task_config, output_dir, device, s
     for ext in extensions:
         image_paths.extend(glob.glob(os.path.join(input_folder, ext)))
         
-    # FIX: Deterministic file ordering
     image_paths = sorted(image_paths)
-        
     print(f"Found {len(image_paths)} images in {input_folder}")
     for path in image_paths:
         predict_single_image(model, path, task, task_config, output_dir, device, save_overlay)
@@ -157,17 +184,21 @@ def main():
     
     print(f"Loading configuration from {args.config}...")
     with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
-    MODEL_CONFIG, TASKS = config["MODEL"], config["TASKS"]
+        full_config = yaml.safe_load(f)
+        
+    TASKS = full_config["TASKS"]
     
     if args.task not in TASKS:
         raise ValueError(f"Task '{args.task}' not found in configuration. Available: {list(TASKS.keys())}")
         
     task_config = TASKS[args.task]
+    
+    # FIX 5: Actually call the palette/config validator!
+    validate_prediction_config(task_config)
         
     print(f"Building Model & Loading Checkpoint: {args.checkpoint}...")
-    model = build_model_from_config(MODEL_CONFIG, TASKS)
-    model = load_checkpoint(model, args.checkpoint, device)
+    model = build_model(full_config)
+    model = load_checkpoint(model, args.checkpoint, device, current_config=full_config)
     
     if os.path.isdir(args.input):
         predict_folder(model, args.input, args.task, task_config, args.output, device, args.overlay)

@@ -1,73 +1,64 @@
-"""
-inference_utils.py
-
-Centralized utilities for TerraMind Mask2Former.
-Ensures identical model reconstruction, target formatting, and post-processing 
-across training, testing, and prediction.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional
 
-from encoder import TerraMindEncoder               
-from neck import TerraMindNeck                     
-from pixel_decoder import MSDeformAttnPixelDecoder 
-from transformer_decoder import MultiScaleMaskedTransformerDecoder 
-from multitask_model import MultiTaskMask2Former             
+from models.terramind_encoder import TerraMindEncoder               
+from models.terramind_neck import TerraMindNeck                     
+from models.pixel_decoder import MSDeformAttnPixelDecoder 
+from models.transformer_decoder import MultiScaleMaskedTransformerDecoder 
+from models.multitask_model import MultiTaskMask2Former             
 
 
 def build_model(config: dict) -> nn.Module:
-    """
-    Strict, config-driven model reconstruction. 
-    Used identically by train.py, test.py, and predict.py.
-    """
     model_cfg = config["MODEL"]
     tasks_cfg = config["TASKS"]
 
-    # 1. Encoder
     encoder = TerraMindEncoder(**model_cfg.get("encoder", {}))
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad = False
         
-    # A1/B1: No fallback values. Strict interface check.
-    embed_dim = getattr(encoder, "embed_dim", None) or getattr(encoder, "out_channels", None)
+    embed_dim = getattr(encoder, "out_channels", None)
     if embed_dim is None:
-        raise AttributeError("Encoder must expose 'embed_dim' or 'out_channels'.")
+        raise AttributeError("Encoder must expose canonical 'out_channels'.")
+    # MISSING 4: Encoder output validation
+    if embed_dim <= 0:
+        raise ValueError(f"Encoder out_channels must be > 0, got {embed_dim}")
 
-    # 2. Neck
     neck = TerraMindNeck(embed_dim=embed_dim, **model_cfg.get("neck", {}))
-    
-    # 3. Pixel Decoder
     pixel_decoder = MSDeformAttnPixelDecoder(conv_dim=neck.hidden_dim, **model_cfg.get("pixel_decoder", {}))
     
-    # 4. Task Decoders
     decoders = {}
     td_cfg = model_cfg.get("transformer_decoder", {})
     for task, t_cfg in tasks_cfg.items():
+        # MISSING 2: Decoder/task agreement validation done at __init__
+        num_classes = t_cfg["num_classes"]
         decoders[task] = MultiScaleMaskedTransformerDecoder(
             in_channels=pixel_decoder.conv_dim, 
-            num_classes=t_cfg["num_classes"], 
+            num_classes=num_classes, 
             mask_dim=pixel_decoder.mask_dim,
             **td_cfg
         )
         
     return MultiTaskMask2Former(encoder, neck, pixel_decoder, decoders)
 
-
 def semantic_to_mask2former_targets(
     semantic_masks: torch.Tensor, 
+    num_classes: int,
     ignore_index: int,
     background_id: Optional[int] = None
 ) -> List[Dict[str, torch.Tensor]]:
     """
-    A5: Standardized target converter. 
+    Standardized target converter. 
     Guarantees output dtypes: labels -> torch.long, masks -> torch.float32.
     """
     if semantic_masks.dtype != torch.long:
-        raise ValueError(f"Semantic masks must be torch.long, got {semantic_masks.dtype}")
+        raise TypeError(f"Semantic masks must be torch.long, got {semantic_masks.dtype}")
+
+    # FIX: Prevent illogical config setups
+    if background_id is not None and background_id == ignore_index:
+        raise ValueError(f"background_id ({background_id}) cannot equal ignore_index ({ignore_index}).")
 
     targets = []
     for mask_i in semantic_masks:
@@ -76,6 +67,10 @@ def semantic_to_mask2former_targets(
         classes = classes[classes != ignore_index]
         if background_id is not None:
             classes = classes[classes != background_id]
+
+        # FIX: Validate class IDs don't exceed the model's prediction head
+        if len(classes) > 0 and classes.max() >= num_classes:
+            raise ValueError(f"Found Class ID {classes.max()} in mask, but num_classes is {num_classes}")
 
         if len(classes) == 0:
             labels = torch.zeros(0, dtype=torch.long, device=mask_i.device)
@@ -91,9 +86,39 @@ def semantic_to_mask2former_targets(
 
 def postprocess_mask2former_outputs(pred_logits: torch.Tensor, pred_masks: torch.Tensor, target_size: tuple) -> torch.Tensor:
     """Mask2Former inference post-processing."""
+    # FIX: Validate Query dimensions match
+    if pred_logits.shape[1] != pred_masks.shape[1]:
+        raise ValueError(f"Query mismatch: logits have {pred_logits.shape[1]} queries, masks have {pred_masks.shape[1]}")
+
     pred_masks = F.interpolate(pred_masks, size=target_size, mode="bilinear", align_corners=False)
     prob = F.softmax(pred_logits, dim=-1)[..., :-1] 
     mask_pred = pred_masks.sigmoid()
     
     sem_seg = torch.einsum("bqc,bqhw->bchw", prob, mask_pred)
     return sem_seg.argmax(dim=1).to(torch.long)
+
+
+def load_checkpoint(model: torch.nn.Module, checkpoint_path: str, device: str, current_config: dict = None) -> torch.nn.Module:
+    """Loads model weights with DDP compatibility and config fingerprinting."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Config fingerprint validation
+    if current_config is not None and "config" in checkpoint:
+        saved_config = checkpoint["config"]
+        saved_tasks = {k: v["num_classes"] for k, v in saved_config.get("TASKS", {}).items()}
+        curr_tasks = {k: v["num_classes"] for k, v in current_config.get("TASKS", {}).items()}
+        if saved_tasks != curr_tasks:
+            raise RuntimeError(f"Checkpoint tasks {saved_tasks} do not match current config {curr_tasks}")
+
+    state_dict = checkpoint.get("model_state", checkpoint)
+    
+    # FIX: Handle Multi-GPU (DDP) saved checkpoints by stripping "module." prefix
+    clean_state_dict = {}
+    for k, v in state_dict.items():
+        clean_key = k[7:] if k.startswith("module.") else k
+        clean_state_dict[clean_key] = v
+
+    model.load_state_dict(clean_state_dict, strict=True)
+    model.to(device)
+    model.eval()
+    return model

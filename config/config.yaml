@@ -1,0 +1,115 @@
+# ==============================================================================
+# TerraMind Multi-Task Mask2Former Configuration (Kaggle Optimized)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. MODEL ARCHITECTURE
+# ------------------------------------------------------------------------------
+MODEL:
+  mask_dim: 256
+  
+  encoder:
+    backbone_name: "terramind_v1_tiny"
+    pretrained: True
+    freeze: True
+    modalities: ["S2L1C", "S2L2A", "S1GRD", "S1RTC", "DEM", "RGB", "Coordinates"]
+    
+  neck:
+    hidden_dim: 256            # <--- Moved here so **kwargs securely catches it
+    num_feature_levels: 4
+
+  pixel_decoder:
+    transformer_dropout: 0.0
+    transformer_nheads: 8
+    transformer_dim_feedforward: 1024
+    transformer_enc_layers: 6
+    
+  transformer_decoder:
+    num_queries: 100
+    nheads: 8
+    dim_feedforward: 2048
+    dec_layers: 9
+    pre_norm: False
+    enforce_input_project: False
+    activation: "gelu"
+
+# ------------------------------------------------------------------------------
+# 2. TRAINING HYPERPARAMETERS
+# ------------------------------------------------------------------------------
+TRAIN:
+  epochs: 50
+  lr: 0.0001
+  weight_decay: 0.05
+  warmup_epochs: 5
+  epoch_mode: "fixed_steps"
+  fixed_steps: 3
+  patience: 15
+  gradient_clip: 1.0
+  amp: True
+
+# ------------------------------------------------------------------------------
+# 3. TASK-SPECIFIC CONFIGURATIONS
+# ------------------------------------------------------------------------------
+TASKS:
+  sen1floods11:
+    num_classes: 2
+    ignore_index: 255
+    background_id: 0
+    batch_size: 2          
+    num_workers: 2         
+    data_root: "/kaggle/working/data/sen1floods11"  # <--- FIXED path mapping
+    scale_factor: 10000.0                           # <--- FIXED GeoTIFF prediction scale
+    rgb_bands: [0, 1, 2] 
+    palette:
+      0: [0, 0, 0]         
+      1: [0, 150, 255]     
+
+  fire_scars:
+    num_classes: 2
+    ignore_index: 255
+    background_id: null
+    batch_size: 2
+    num_workers: 2
+    data_root: "/kaggle/working/data/fire_scars"
+    scale_factor: 1.0                               # <--- Explicit scale factor
+    rgb_bands: [0, 1, 2]
+    palette:
+      0: [0, 0, 0]         
+      1: [255, 50, 50]     
+
+  m_chesapeake_landcover:
+    num_classes: 7
+    ignore_index: 255
+    background_id: null
+    batch_size: 2
+    num_workers: 2
+    data_root: "/kaggle/working/data/chesapeake"
+    scale_factor: 1.0                               # <--- Explicit scale factor
+    rgb_bands: [0, 1, 2]
+    palette:
+      0: [0, 0, 0]         
+      1: [0, 0, 255]       
+      2: [0, 128, 0]       
+      3: [144, 238, 144]   
+      4: [210, 180, 140]   
+      5: [105, 105, 105]   
+      6: [128, 128, 128]   
+
+# ------------------------------------------------------------------------------
+# 4. HUNGARIAN MATCHER 
+# ------------------------------------------------------------------------------
+MATCHER:
+  cost_class: 2.0
+  cost_mask: 5.0
+  cost_dice: 5.0
+  num_points: 12544
+
+# ------------------------------------------------------------------------------
+# 5. LOSS CRITERION
+# ------------------------------------------------------------------------------
+CRITERION:
+  eos_coef: 0.1
+  oversample_ratio: 3.0
+  importance_sample_ratio: 0.75
+  num_points: 12544
+  losses: ["labels", "masks"]

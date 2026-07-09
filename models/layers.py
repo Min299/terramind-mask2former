@@ -1,9 +1,6 @@
 import torch
 import torch.nn as nn
 
-
-
-
 class ConvNormAct(nn.Module):
     """
     Conv -> GroupNorm -> GELU

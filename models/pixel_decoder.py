@@ -77,72 +77,90 @@ class MSDeformAttnPixelDecoder(nn.Module):
                 nn.init.constant_(module.bias, 0)
 
     def forward(self, features: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        srcs, pos = [], []
-        for name in self.transformer_levels:
-            if name not in features:
-                raise KeyError(f"PixelDecoder expected feature '{name}' from backbone.")
-            
-            x = features[name]
-            # A3: Channel validation
-            if x.shape[1] != self.conv_dim:
-                raise ValueError(f"PixelDecoder expected {self.conv_dim} channels, got {x.shape[1]} from '{name}'.")
-            
-            srcs.append(x)
-            pos.append(self.pe_layer(x))
-        # ... rest of forward        
+            # 1. Validate required features exist (allows extra unused features for extensibility)
+            expected_keys = set(self.transformer_levels) | {self.fpn_level}
+            missing_keys = expected_keys - set(features.keys())
+            if missing_keys:
+                raise KeyError(f"PixelDecoder missing required features from backbone: {missing_keys}")
 
-        # Run multi-scale deformable attention encoder
-        y, spatial_shapes, _ = self.transformer(srcs, pos)
-        bs = y.shape[0]
+            # 2. Check spatial ordering (Resolutions must strictly decrease: res2 > res3 > res4 > res5)
+            spatial_shapes = [features[k].shape[-2:] for k in [self.fpn_level] + list(self.transformer_levels)]
+            for i in range(len(spatial_shapes) - 1):
+                h1, w1 = spatial_shapes[i]
+                h2, w2 = spatial_shapes[i+1]
+                if h1 <= h2 or w1 <= w2:
+                    raise RuntimeError(
+                        f"Spatial ordering invalid. Level {i} ({h1}x{w1}) "
+                        f"not strictly larger than {i+1} ({h2}x{w2})"
+                    )
 
-        # Split the flattened output back into separate levels
-        split_sizes = [spatial_shapes[i][0] * spatial_shapes[i][1] for i in range(len(spatial_shapes))]
-        y = torch.split(y, split_sizes, dim=1)
-        
-        # Reshape transformer tokens back to 2D spatial grids
-        transformer_features = []
-        for i, z in enumerate(y):
-            h, w = spatial_shapes[i]
-            # .reshape() replaces .view() to safely handle non-contiguous memory from .transpose()
-            transformer_features.append(z.transpose(1, 2).reshape(bs, self.conv_dim, h, w))
+            # ----------------------------------------------------------------------
+            # PIPELINE 1: Transformer (Semantic Features)
+            # ----------------------------------------------------------------------
+            srcs, pos = [], []
+            for name in self.transformer_levels:
+                x = features[name]  # No .float() cast; preserves AMP
+                
+                # Channel validation
+                if x.shape[1] != self.conv_dim:
+                    raise ValueError(f"PixelDecoder expected {self.conv_dim} channels, got {x.shape[1]} from '{name}'.")
+                
+                srcs.append(x)
+                pos.append(self.pe_layer(x))
+
+            # Run multi-scale deformable attention encoder
+            y, spatial_shapes_transformer, _ = self.transformer(srcs, pos)
+            bs = y.shape[0]
+
+            # Split the flattened output back into separate levels
+            split_sizes = [h * w for h, w in spatial_shapes_transformer]
+            y = torch.split(y, split_sizes, dim=1)
             
-        assert len(transformer_features) == 3, "Transformer must output exactly 3 levels."
-        
-        # transformer_features:
-        # [0] res5'
-        # [1] res4'
-        # [2] res3'
-
-        # ----------------------------------------------------------------------
-        # PIPELINE 2: FPN (Boundary Mask Feature)
-        # ----------------------------------------------------------------------
-        if self.fpn_level not in features:
-            raise ValueError(f"Expected feature '{self.fpn_level}' from backbone neck for FPN.")
+            # Reshape transformer tokens back to 2D spatial grids
+            transformer_features = []
+            for i, z in enumerate(y):
+                h, w = spatial_shapes_transformer[i]
+                # .reshape() replaces .view() to safely handle non-contiguous memory from .transpose()
+                transformer_features.append(z.transpose(1, 2).reshape(bs, self.conv_dim, h, w))
+                
+            if len(transformer_features) != self.transformer_num_feature_levels:
+                raise ValueError(f"Transformer must output exactly {self.transformer_num_feature_levels} levels.")
             
-        raw_res2 = features[self.fpn_level]     # No .float() cast
-        assert raw_res2.shape[1] == self.conv_dim, f"FPN input must have {self.conv_dim} channels."
-        
-        # 1x1 lateral projection to align the raw backbone feature
-        lateral = self.lateral_conv(raw_res2)
-        
-        # Upsample the contextualized res3' from the transformer
-        upsampled_res3 = F.interpolate(
-            transformer_features[-1], 
-            size=lateral.shape[-2:], 
-            mode="bilinear", 
-            align_corners=False
-        )
-        
-        # Fuse and smooth
-        fpn_res2 = self.output_conv(lateral + upsampled_res3)
-        
-        # Generate final highest-resolution mask feature
-        mask_features = self.mask_features(fpn_res2)
+            # transformer_features:
+            # [0] res5'
+            # [1] res4'
+            # [2] res3'
 
-        # ----------------------------------------------------------------------
-        # FINAL OUTPUTS
-        # ----------------------------------------------------------------------
-        return (
-            mask_features,
-            transformer_features,
-        )
+            # ----------------------------------------------------------------------
+            # PIPELINE 2: FPN (Boundary Mask Feature)
+            # ----------------------------------------------------------------------
+            raw_res2 = features[self.fpn_level]
+            
+            if raw_res2.shape[1] != self.conv_dim:
+                raise ValueError(f"FPN input '{self.fpn_level}' must have {self.conv_dim} channels, got {raw_res2.shape[1]}")
+            
+            # 1x1 lateral projection to align the raw backbone feature
+            lateral = self.lateral_conv(raw_res2)
+            
+            # Upsample the contextualized res3' from the transformer
+            upsampled_res3 = F.interpolate(
+                transformer_features[-1], 
+                size=lateral.shape[-2:], 
+                mode="bilinear", 
+                align_corners=False
+            )
+            
+            # Fuse and smooth
+            fpn_res2 = self.output_conv(lateral + upsampled_res3)
+            
+            # Generate final highest-resolution mask feature
+            mask_features = self.mask_features(fpn_res2)
+            
+            # Output dim validation
+            if mask_features.shape[1] != self.mask_dim:
+                raise ValueError(f"Mask features channels {mask_features.shape[1]} != expected mask_dim {self.mask_dim}")
+
+            # ----------------------------------------------------------------------
+            # FINAL OUTPUTS
+            # ----------------------------------------------------------------------
+            return mask_features, transformer_features
