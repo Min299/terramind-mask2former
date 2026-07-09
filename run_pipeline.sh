@@ -10,8 +10,8 @@ echo "======================================================="
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
 # 2. Define our input and output directories
-CONFIG_PATH="./configs/config.yaml"
-SAVE_DIR="/kaggle/working/checkpoints/run_01"
+CONFIG_PATH="./config/config.yaml"
+SAVE_DIR="./checkpoints/run_01"
 
 echo ">>> [1/2] RUNNING TRAINING..."
 python scripts/train.py \
