@@ -23,7 +23,30 @@ class TerraMindEncoder(nn.Module):
             modalities=list(modalities),
         )
 
-        self.out_channels = self.encoder.out_channels
+        channels = self.encoder.out_channels
+
+        # TerraTorch may expose out_channels as a list/tuple
+        if isinstance(channels, (list, tuple)):
+            if len(channels) == 0:
+                raise RuntimeError("Encoder out_channels is empty.")
+
+            # TerraMind should have the same embedding dimension at every extracted layer
+            if len(set(channels)) != 1:
+                raise RuntimeError(
+                    f"Inconsistent encoder embedding dimensions: {channels}"
+                )
+
+            channels = channels[0]
+
+        elif not isinstance(channels, int):
+            raise TypeError(
+                f"Expected encoder.out_channels to be int or list[int], got {type(channels)}"
+            )
+
+        if channels <= 0:
+            raise ValueError(f"Invalid encoder out_channels: {channels}")
+
+        self.out_channels = channels
 
         if freeze:
             self.freeze()
