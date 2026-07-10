@@ -6,6 +6,7 @@
 # 1. MODEL ARCHITECTURE
 # ------------------------------------------------------------------------------
 MODEL:
+  hidden_dim: 256
   mask_dim: 256
   
   encoder:
@@ -15,7 +16,6 @@ MODEL:
     modalities: ["S2L1C", "S2L2A", "S1GRD", "S1RTC", "DEM", "RGB", "Coordinates"]
     
   neck:
-    hidden_dim: 256            # <--- Moved here so **kwargs securely catches it
     num_feature_levels: 4
 
   pixel_decoder:

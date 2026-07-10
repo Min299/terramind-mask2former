@@ -20,24 +20,26 @@ def build_model(config: dict) -> nn.Module:
         p.requires_grad = False
         
     embed_dim = getattr(encoder, "out_channels", None)
-    if embed_dim is None:
-        raise AttributeError("Encoder must expose canonical 'out_channels'.")
-    # MISSING 4: Encoder output validation
-    if embed_dim <= 0:
-        raise ValueError(f"Encoder out_channels must be > 0, got {embed_dim}")
+    if embed_dim is None or embed_dim <= 0:
+        raise AttributeError("Encoder must expose canonical 'out_channels' > 0.")
 
-    neck = TerraMindNeck(embed_dim=embed_dim, **model_cfg.get("neck", {}))
-    pixel_decoder = MSDeformAttnPixelDecoder(conv_dim=neck.hidden_dim, **model_cfg.get("pixel_decoder", {}))
+    # Grab the global dimensions explicitly
+    hidden_dim = model_cfg["hidden_dim"]
+    mask_dim = model_cfg["mask_dim"]
+
+    # Explicitly pass hidden_dim
+    neck = TerraMindNeck(embed_dim=embed_dim, hidden_dim=hidden_dim, **model_cfg.get("neck", {}))
+    
+    # Explicitly pass hidden_dim as conv_dim
+    pixel_decoder = MSDeformAttnPixelDecoder(conv_dim=hidden_dim, mask_dim=mask_dim, **model_cfg.get("pixel_decoder", {}))
     
     decoders = {}
     td_cfg = model_cfg.get("transformer_decoder", {})
     for task, t_cfg in tasks_cfg.items():
-        # MISSING 2: Decoder/task agreement validation done at __init__
-        num_classes = t_cfg["num_classes"]
         decoders[task] = MultiScaleMaskedTransformerDecoder(
-            in_channels=pixel_decoder.conv_dim, 
-            num_classes=num_classes, 
-            mask_dim=pixel_decoder.mask_dim,
+            in_channels=hidden_dim,  # Tied explicitly to the global hidden_dim
+            num_classes=t_cfg["num_classes"], 
+            mask_dim=mask_dim,       # Tied explicitly to the global mask_dim
             **td_cfg
         )
         
