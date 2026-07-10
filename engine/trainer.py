@@ -134,7 +134,8 @@ class MultiTaskTrainer:
         with open(os.path.join(self.save_dir, "training.log"), "w") as f:
             f.write("--- Training Log Initialized ---\n\n")
 
-    def save_checkpoint(self, epoch: int, is_best: bool = False, filename: str = "latest.pth"):
+    def save_checkpoint(self, epoch: int, filename: str = "best_model.pth"):
+        """Saves the training state. (Simplified to prevent filename mixups)"""
         state = {
             "epoch": epoch,
             "best_epoch": self.best_epoch,
@@ -146,8 +147,6 @@ class MultiTaskTrainer:
             "best_loss": self.best_loss,
         }
         torch.save(state, os.path.join(self.save_dir, filename))
-        if is_best:
-            torch.save(state, os.path.join(self.save_dir, "best.pth"))
 
     def resume(self, checkpoint_path: str):
         print(f"Resuming from {checkpoint_path}...")
@@ -250,6 +249,12 @@ class MultiTaskTrainer:
                     background_id=task_cfg.get("background_id", None)
                 )
 
+                # We extract metadata safely but don't pass it to the model 
+                # to strictly obey the multi-task model's forward signature.
+                metadata = batch.get("metadata", None)
+                if metadata is not None and isinstance(metadata, dict):
+                    metadata = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in metadata.items()}
+
                 with torch.autocast(device_type="cuda" if use_amp else "cpu", enabled=use_amp):
                     outputs = self.model(images, task=task)
                     loss_dict = self.criteria[task](outputs, targets)
@@ -262,16 +267,16 @@ class MultiTaskTrainer:
                 task_dice += loss_dict.get("loss_dice", torch.tensor(0.0)).item()
                 steps += 1
                 
-                # Replace the dangerous manual logic with the official, centralized post-processor!
                 target_size = semantic_masks.shape[-2:]
                 pred_semantic = postprocess_mask2former_outputs(outputs["pred_logits"], outputs["pred_masks"], target_size)
                 
                 metric_tracker.update(pred_semantic, semantic_masks)
                 
-            metrics["loss"] += task_loss / steps
-            metrics["loss_ce"] += task_ce / steps
-            metrics["loss_mask"] += task_mask / steps
-            metrics["loss_dice"] += task_dice / steps
+            # FIX: Prevent ZeroDivisionError if a validation dataloader is empty!
+            metrics["loss"] += task_loss / steps if steps > 0 else 0.0
+            metrics["loss_ce"] += task_ce / steps if steps > 0 else 0.0
+            metrics["loss_mask"] += task_mask / steps if steps > 0 else 0.0
+            metrics["loss_dice"] += task_dice / steps if steps > 0 else 0.0
             
             res = metric_tracker.compute()
             metrics["miou"] += res["miou"]
@@ -344,14 +349,10 @@ class MultiTaskTrainer:
                 self.best_loss = val_metrics["loss"]
                 self.best_epoch = epoch
                 self.epochs_without_improvement = 0
-                self.save_checkpoint(epoch)
+                self.save_checkpoint(epoch, filename="best_model.pth")
                 print(f"*** New best model saved! (Loss: {self.best_loss:.4f}) ***\n")
             else:
                 self.epochs_without_improvement += 1
-
-            # Delete or comment out these lines!
-            # if epoch % 10 == 0:
-            #     torch.save(state, os.path.join(self.save_dir, f"epoch_{epoch}.pth"))
 
             if self.epochs_without_improvement >= self.patience:
                 print(f"Early stopping triggered after {epoch} epochs.")
