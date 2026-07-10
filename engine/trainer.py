@@ -349,6 +349,10 @@ class MultiTaskTrainer:
             else:
                 self.epochs_without_improvement += 1
 
+            # Delete or comment out these lines!
+            # if epoch % 10 == 0:
+            #     torch.save(state, os.path.join(self.save_dir, f"epoch_{epoch}.pth"))
+
             if self.epochs_without_improvement >= self.patience:
                 print(f"Early stopping triggered after {epoch} epochs.")
                 break
