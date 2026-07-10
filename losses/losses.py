@@ -268,11 +268,11 @@ def sample_uncertain_points(
     """
 
     return get_uncertain_point_coords_with_randomness(
-        logits=logits,
-        uncertainty_func=uncertainty_fn,
-        num_points=num_points,
-        oversample_ratio=oversample_ratio,
-        importance_sample_ratio=importance_sample_ratio,
+        logits,
+        uncertainty_fn,
+        num_points,
+        oversample_ratio,
+        importance_sample_ratio,
     )
 
 

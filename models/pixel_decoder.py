@@ -84,7 +84,14 @@ class MSDeformAttnPixelDecoder(nn.Module):
                 raise KeyError(f"PixelDecoder missing required features from backbone: {missing_keys}")
 
             # 2. Check spatial ordering (Resolutions must strictly decrease: res2 > res3 > res4 > res5)
-            spatial_shapes = [features[k].shape[-2:] for k in [self.fpn_level] + list(self.transformer_levels)]
+            # NOTE: self.transformer_levels is intentionally ordered coarse-to-fine
+            # (res5, res4, res3) for the deformable-attention encoder -- that is NOT
+            # the same as spatial resolution order. Validate against the canonical
+            # descending-resolution order (res2 > res3 > res4 > res5), not against
+            # [fpn_level] + transformer_levels, which would incorrectly compare
+            # res5 (coarsest) directly against res4 (finer) and always fail.
+            canonical_order = ["res2", "res3", "res4", "res5"]
+            spatial_shapes = [features[k].shape[-2:] for k in canonical_order if k in features]
             for i in range(len(spatial_shapes) - 1):
                 h1, w1 = spatial_shapes[i]
                 h2, w2 = spatial_shapes[i+1]

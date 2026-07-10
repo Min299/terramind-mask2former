@@ -73,11 +73,13 @@ class SetCriterion(nn.Module):
 
     def loss_masks(self, outputs, targets, indices, num_masks):
         src_idx = self._get_src_permutation_idx(indices)
-        tgt_idx = self._get_tgt_permutation_idx(indices)
 
         src_masks = outputs["pred_masks"][src_idx]
-        target_masks = torch.cat([t["masks"] for t in targets], dim=0).to(src_masks)
-        target_masks = target_masks[tgt_idx]
+        # Select each target's matched masks (by J) per-target BEFORE concatenating,
+        # so the batch dimension is never collapsed. Do NOT index the already-flattened
+        # concatenation with (batch_idx, tgt_idx) -- that indexes two dimensions at
+        # once and silently corrupts the mask's spatial shape.
+        target_masks = torch.cat([t["masks"][J] for t, (_, J) in zip(targets, indices)], dim=0).to(src_masks)
 
         src_masks = src_masks[:, None]
         target_masks = target_masks[:, None]

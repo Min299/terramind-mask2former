@@ -27,11 +27,33 @@ TASK_REGISTRY = {
     "m_chesapeake_landcover": MChesapeakeLandcoverNonGeoDataModule,
 }
 
-# Task-bookkeeping keys that our own code (trainer/criterion/metrics) needs
-# from tasks.yaml but that are NOT constructor arguments of the TerraTorch
-# DataModules themselves. These must never be forwarded to TASK_REGISTRY[...](**kwargs)
-# or the DataModule constructor will raise TypeError("unexpected keyword argument").
-_NON_DATAMODULE_KEYS = {"dataset", "num_classes", "ignore_index", "background_id"}
+# Task-bookkeeping / visualization-only keys that our own code needs from
+# the TASKS config block but that are NOT constructor arguments of the
+# TerraTorch DataModules themselves (scale_factor/rgb_bands/palette are read
+# directly by scripts/predict.py). These must never be forwarded to
+# TASK_REGISTRY[...](**kwargs) or the DataModule constructor will raise
+# TypeError("unexpected keyword argument") -- confirmed for
+# MChesapeakeLandcoverNonGeoDataModule, whose setup() forwards **kwargs
+# straight into the dataset constructor (unlike Sen1Floods11/FireScars,
+# which override setup() with an explicit arg list and are safe either way).
+_NON_DATAMODULE_KEYS = {
+    "dataset", "num_classes", "ignore_index", "background_id",
+    "scale_factor", "rgb_bands", "palette",
+}
+
+# `collate_fn` must NEVER be passed as a constructor kwarg to a TerraTorch
+# NonGeoDataModule subclass:
+#   1. torchgeo's NonGeoDataModule.__init__ unconditionally does
+#      `self.collate_fn = default_collate` right after storing **kwargs, so a
+#      collate_fn passed into the constructor is silently discarded anyway.
+#   2. MChesapeakeLandcoverNonGeoDataModule ("m_chesapeake_landcover" task)
+#      doesn't override setup() and forwards **self.kwargs -- including an
+#      unrecognized collate_fn -- straight into the underlying dataset's
+#      constructor, which does not accept it. Confirmed TypeError against
+#      the real terratorch package.
+# The correct way to inject a custom collate function is to set it as an
+# attribute *after* the datamodule is constructed (see below).
+_POST_INIT_ATTR_KEYS = {"collate_fn"}
 
 
 def _filter_datamodule_kwargs(datamodule_cls, kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -130,9 +152,19 @@ class MultiTaskDataModule(pl.LightningDataModule):
             if "batch_size" not in kwargs:
                 raise ValueError(f"Missing 'batch_size' for task {task}")
 
+            kwargs = dict(kwargs)  # don't mutate the caller's config dict
+            post_init_attrs = {
+                k: kwargs.pop(k) for k in list(kwargs) if k in _POST_INIT_ATTR_KEYS
+            }
+
             datamodule_cls = TASK_REGISTRY[task]
             dm_kwargs = _filter_datamodule_kwargs(datamodule_cls, kwargs)
-            self.datamodules[task] = datamodule_cls(**dm_kwargs)
+            dm = datamodule_cls(**dm_kwargs)
+
+            for attr_name, attr_value in post_init_attrs.items():
+                setattr(dm, attr_name, attr_value)
+
+            self.datamodules[task] = dm
 
     def prepare_data(self):
         """Delegates downloading/preparation to TerraTorch."""
