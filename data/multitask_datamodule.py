@@ -22,9 +22,9 @@ from terratorch.datamodules import (
 # Maps our internal task name -> the real TerraTorch DataModule class that
 # actually loads/streams that task's data.
 TASK_REGISTRY = {
-    "flood": Sen1Floods11NonGeoDataModule,
-    "burn": FireScarsNonGeoDataModule,
-    "lulc": MChesapeakeLandcoverNonGeoDataModule,
+    "sen1floods11": Sen1Floods11NonGeoDataModule,
+    "fire_scars": FireScarsNonGeoDataModule,
+    "m_chesapeake_landcover": MChesapeakeLandcoverNonGeoDataModule,
 }
 
 # Task-bookkeeping keys that our own code (trainer/criterion/metrics) needs
