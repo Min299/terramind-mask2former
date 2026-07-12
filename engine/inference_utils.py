@@ -25,11 +25,11 @@ def build_model(config: dict) -> nn.Module:
     if embed_dim is None or embed_dim <= 0:
         raise AttributeError("Encoder must expose canonical 'out_channels' > 0.")
 
-    # Grab the global dimensions explicitly
-    hidden_dim = model_cfg["hidden_dim"]
+    # Grab the global dimensions from MODEL config
+    hidden_dim = model_cfg.get("hidden_dim", model_cfg.get("neck", {}).get("hidden_dim", 256))
     mask_dim = model_cfg["mask_dim"]
 
-    # Explicitly pass hidden_dim
+    # Explicitly pass hidden_dim to neck
     neck = TerraMindNeck(embed_dim=embed_dim, hidden_dim=hidden_dim, **model_cfg.get("neck", {}))
     
     # Explicitly pass hidden_dim as conv_dim

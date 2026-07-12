@@ -2,11 +2,11 @@
 # TerraMind Multi-Task Mask2Former Configuration (Kaggle Optimized)
 # ==============================================================================
 
+
 # ------------------------------------------------------------------------------
 # 1. MODEL ARCHITECTURE
 # ------------------------------------------------------------------------------
 MODEL:
-  hidden_dim: 256
   mask_dim: 256
   
   encoder:
@@ -16,7 +16,9 @@ MODEL:
     modalities: ["S2L1C", "S2L2A", "S1GRD", "S1RTC", "DEM", "RGB", "Coordinates"]
     
   neck:
+    hidden_dim: 256            # <--- Moved here so **kwargs securely catches it
     num_feature_levels: 4
+
 
   pixel_decoder:
     transformer_dropout: 0.0
@@ -33,36 +35,31 @@ MODEL:
     enforce_input_project: False
     activation: "gelu"
 
-# ------------------------------------------------------------------------------
-# 2. DATA CONFIGURATION
-# ------------------------------------------------------------------------------
-data:
-  batch_size: 4               
-  num_workers: 2              
 
 # ------------------------------------------------------------------------------
-# 3. TRAINING HYPERPARAMETERS
+# 2. TRAINING HYPERPARAMETERS
 # ------------------------------------------------------------------------------
-training:
+TRAIN:
   epochs: 50
   lr: 0.0001
   weight_decay: 0.05
   warmup_epochs: 5
   epoch_mode: "fixed_steps"
-  fixed_steps: 1000         
+  fixed_steps: 2000
   patience: 15
   gradient_clip: 1.0
   amp: True
 
+
 # ------------------------------------------------------------------------------
-# 4. TASK-SPECIFIC CONFIGURATIONS
+# 3. TASK-SPECIFIC CONFIGURATIONS
 # ------------------------------------------------------------------------------
 TASKS:
   sen1floods11:
     num_classes: 2
     ignore_index: 255
     background_id: 0
-    batch_size: 2          
+    batch_size: 4          
     num_workers: 2         
     data_root: "/kaggle/working/data/sen1floods11"  # <--- FIXED path mapping
     scale_factor: 10000.0                           # <--- FIXED GeoTIFF prediction scale
@@ -71,11 +68,12 @@ TASKS:
       0: [0, 0, 0]         
       1: [0, 150, 255]     
 
+
   fire_scars:
     num_classes: 2
     ignore_index: 255
     background_id: null
-    batch_size: 2
+    batch_size: 4
     num_workers: 2
     data_root: "/kaggle/working/data/fire_scars"
     scale_factor: 1.0                               # <--- Explicit scale factor
@@ -84,11 +82,12 @@ TASKS:
       0: [0, 0, 0]         
       1: [255, 50, 50]     
 
+
   m_chesapeake_landcover:
     num_classes: 7
     ignore_index: 255
     background_id: null
-    batch_size: 2
+    batch_size: 4
     num_workers: 2
     data_root: "/kaggle/working/data/chesapeake"
     scale_factor: 1.0                               # <--- Explicit scale factor
@@ -102,6 +101,7 @@ TASKS:
       5: [105, 105, 105]   
       6: [128, 128, 128]   
 
+
 # ------------------------------------------------------------------------------
 # 4. HUNGARIAN MATCHER 
 # ------------------------------------------------------------------------------
@@ -110,6 +110,7 @@ MATCHER:
   cost_mask: 5.0
   cost_dice: 5.0
   num_points: 12544
+
 
 # ------------------------------------------------------------------------------
 # 5. LOSS CRITERION
