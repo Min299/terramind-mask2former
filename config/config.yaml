@@ -3,6 +3,8 @@
 # ==============================================================================
 
 
+
+
 # ------------------------------------------------------------------------------
 # 1. MODEL ARCHITECTURE
 # ------------------------------------------------------------------------------
@@ -11,14 +13,18 @@ MODEL:
   hidden_dim: 256            # <--- Moved here so **kwargs securely catches it
 
 
+
+
   encoder:
-    backbone_name: "terramind_v1_tiny"
+    backbone_name: "terramind_v1_base"
     pretrained: True
     freeze: True
     modalities: ["S2L1C", "S2L2A", "S1GRD", "S1RTC", "DEM", "RGB", "Coordinates"]
     
   neck:
     num_feature_levels: 4
+
+
 
 
   pixel_decoder:
@@ -37,6 +43,8 @@ MODEL:
     activation: "gelu"
 
 
+
+
 # ------------------------------------------------------------------------------
 # 2. TRAINING HYPERPARAMETERS
 # ------------------------------------------------------------------------------
@@ -46,10 +54,12 @@ TRAIN:
   weight_decay: 0.05
   warmup_epochs: 5
   epoch_mode: "fixed_steps"
-  fixed_steps: 1000
-  patience: 15
+  fixed_steps: 1500
+  patience: 8
   gradient_clip: 1.0
   amp: True
+
+
 
 
 # ------------------------------------------------------------------------------
@@ -61,7 +71,7 @@ TASKS:
     ignore_index: 255
     background_id: 0
     batch_size: 4          
-    num_workers: 2         
+    num_workers: 4        
     data_root: "/kaggle/working/data/sen1floods11"  # <--- FIXED path mapping
     scale_factor: 10000.0                           # <--- FIXED GeoTIFF prediction scale
     rgb_bands: [0, 1, 2] 
@@ -70,12 +80,14 @@ TASKS:
       1: [0, 150, 255]     
 
 
+
+
   fire_scars:
     num_classes: 2
     ignore_index: 255
     background_id: null
     batch_size: 4
-    num_workers: 2
+    num_workers: 4
     data_root: "/kaggle/working/data/fire_scars"
     scale_factor: 1.0                               # <--- Explicit scale factor
     rgb_bands: [0, 1, 2]
@@ -84,12 +96,14 @@ TASKS:
       1: [255, 50, 50]     
 
 
+
+
   m_chesapeake_landcover:
     num_classes: 7
     ignore_index: 255
     background_id: null
     batch_size: 4
-    num_workers: 2
+    num_workers: 4
     data_root: "/kaggle/working/data/chesapeake"
     scale_factor: 1.0                               # <--- Explicit scale factor
     rgb_bands: [0, 1, 2]
@@ -103,6 +117,8 @@ TASKS:
       6: [128, 128, 128]   
 
 
+
+
 # ------------------------------------------------------------------------------
 # 4. HUNGARIAN MATCHER 
 # ------------------------------------------------------------------------------
@@ -111,6 +127,8 @@ MATCHER:
   cost_mask: 5.0
   cost_dice: 5.0
   num_points: 12544
+
+
 
 
 # ------------------------------------------------------------------------------
