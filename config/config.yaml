@@ -8,7 +8,9 @@
 # ------------------------------------------------------------------------------
 MODEL:
   mask_dim: 256
-  
+  hidden_dim: 256            # <--- Moved here so **kwargs securely catches it
+
+
   encoder:
     backbone_name: "terramind_v1_tiny"
     pretrained: True
@@ -16,7 +18,6 @@ MODEL:
     modalities: ["S2L1C", "S2L2A", "S1GRD", "S1RTC", "DEM", "RGB", "Coordinates"]
     
   neck:
-    hidden_dim: 256            # <--- Moved here so **kwargs securely catches it
     num_feature_levels: 4
 
 
@@ -45,7 +46,7 @@ TRAIN:
   weight_decay: 0.05
   warmup_epochs: 5
   epoch_mode: "fixed_steps"
-  fixed_steps: 2000
+  fixed_steps: 1000
   patience: 15
   gradient_clip: 1.0
   amp: True
