@@ -102,6 +102,7 @@ class SetCriterion(nn.Module):
         }
 
     def _get_src_permutation_idx(self, indices):
+        indices = [(s.cuda(), t.cuda()) for s, t in indices]
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for src, _ in indices])
         return batch_idx, src_idx

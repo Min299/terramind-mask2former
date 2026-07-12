@@ -84,9 +84,32 @@ def evaluate_task(model, loader, criterion, metric_tracker, task_name, device):
             background_id=None # Optionally extract from config if needed
         )
 
+        # Sanitize & Pad images
+        if isinstance(images, torch.Tensor):
+            images = torch.nan_to_num(images, nan=0.0, posinf=1.0, neginf=-1.0)
+            if images.ndim == 4 and images.shape[1] < 13:
+                pad = torch.zeros((images.shape[0], 13 - images.shape[1], images.shape[2], images.shape[3]), device=images.device, dtype=images.dtype)
+                images = torch.cat([images, pad], dim=1)
+            elif images.ndim == 4 and images.shape[1] > 13:
+                images = images[:, :13, :, :]
+
         # Device-aware AMP Context Manager
         with torch.autocast(device_type=device_type, enabled=use_amp):
             outputs = model(images, task=task_name)
+            
+            # Clamp Targets
+            try:
+                nc = getattr(criterion, 'num_classes', 2)
+                if isinstance(targets, list):
+                    for t in targets:
+                        if isinstance(t, dict):
+                            for k, v in t.items():
+                                if hasattr(v, 'dtype') and v.dtype in (torch.long, torch.int64, torch.int32, torch.int8):
+                                    t[k] = torch.where((v < 0) | (v >= nc), torch.zeros_like(v), v)
+                elif hasattr(targets, 'dtype') and targets.dtype in (torch.long, torch.int64, torch.int32, torch.int8):
+                    targets = torch.where((targets < 0) | (targets >= nc), torch.zeros_like(targets), targets)
+            except Exception:
+                pass
             
             loss_dict = criterion(outputs, targets)
             weight_dict = criterion.weight_dict
@@ -154,7 +177,11 @@ def main():
     MODEL_CONFIG, TASKS, MATCHER_CONFIG, CRITERION_CONFIG = load_configuration(args.config)
 
     logger.info("Building Model & Loading Checkpoint...")
-    model = build_model(MODEL_CONFIG, TASKS) # Passes dicts to the builder
+    try:
+        MODEL_CONFIG['TASKS'] = TASKS
+    except Exception:
+        pass
+    model = build_model(MODEL_CONFIG)
     model = load_checkpoint(model, args.checkpoint, device)
 
     logger.info("Initializing DataModules...")

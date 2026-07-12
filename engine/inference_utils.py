@@ -11,8 +11,8 @@ from models.multitask_model import MultiTaskMask2Former
 
 
 def build_model(config: dict) -> nn.Module:
-    model_cfg = config["MODEL"]
-    tasks_cfg = config["TASKS"]
+    model_cfg = config.get("MODEL", config.get("model", config))
+    tasks_cfg = config.get("TASKS", config.get("tasks", []))
 
     encoder = TerraMindEncoder(**model_cfg.get("encoder", {}))
     encoder.eval()
@@ -20,6 +20,8 @@ def build_model(config: dict) -> nn.Module:
         p.requires_grad = False
         
     embed_dim = getattr(encoder, "out_channels", None)
+    if isinstance(embed_dim, (list, tuple)) or type(embed_dim).__name__ == "ListConfig":
+        embed_dim = embed_dim[0]
     if embed_dim is None or embed_dim <= 0:
         raise AttributeError("Encoder must expose canonical 'out_channels' > 0.")
 

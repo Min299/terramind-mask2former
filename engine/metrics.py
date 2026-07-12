@@ -23,6 +23,7 @@ class SegmentationMetrics:
         targets = targets[valid_mask]
         
         bins = self.num_classes * targets + preds
+        bins = bins[bins >= 0]  # Safely ignore -1 (No Data) pixels
         hist = np.bincount(bins, minlength=self.num_classes**2).reshape(self.num_classes, self.num_classes)
         self.confusion_matrix += hist
 

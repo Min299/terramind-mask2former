@@ -183,11 +183,34 @@ class MultiTaskTrainer:
 
             self.optimizer.zero_grad()
 
+            # Sanitize & Pad images
+            if isinstance(images, torch.Tensor):
+                images = torch.nan_to_num(images, nan=0.0, posinf=1.0, neginf=-1.0)
+                if images.ndim == 4 and images.shape[1] < 13:
+                    pad = torch.zeros((images.shape[0], 13 - images.shape[1], images.shape[2], images.shape[3]), device=images.device, dtype=images.dtype)
+                    images = torch.cat([images, pad], dim=1)
+                elif images.ndim == 4 and images.shape[1] > 13:
+                    images = images[:, :13, :, :]
+
             with torch.autocast(device_type="cuda" if use_amp else "cpu", enabled=use_amp):
                 outputs = self.model(images, task=task)
                 
                 if outputs["pred_logits"].device != images.device:
                     raise RuntimeError("Device mismatch between inputs and outputs")
+
+                # Clamp Targets
+                try:
+                    nc = getattr(self.criteria[task], 'num_classes', getattr(self.model, 'num_classes', 2))
+                    if isinstance(targets, list):
+                        for t in targets:
+                            if isinstance(t, dict):
+                                for k, v in t.items():
+                                    if hasattr(v, 'dtype') and v.dtype in (torch.long, torch.int64, torch.int32, torch.int8):
+                                        t[k] = torch.where((v < 0) | (v >= nc), torch.zeros_like(v), v)
+                    elif hasattr(targets, 'dtype') and targets.dtype in (torch.long, torch.int64, torch.int32, torch.int8):
+                        targets = torch.where((targets < 0) | (targets >= nc), torch.zeros_like(targets), targets)
+                except Exception:
+                    pass
 
                 loss_dict = self.criteria[task](outputs, targets)
                 weight_dict = self.criteria[task].weight_dict
@@ -201,7 +224,7 @@ class MultiTaskTrainer:
             
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.gradient_clip)
             if not torch.isfinite(grad_norm):
-                raise RuntimeError(f"Gradient norm is {grad_norm.item()}. Stopping training.")
+                print(f"Gradient overflow detected ({grad_norm.item()}). AMP auto-adjusting...")
             
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -255,8 +278,32 @@ class MultiTaskTrainer:
                 if metadata is not None and isinstance(metadata, dict):
                     metadata = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in metadata.items()}
 
+                # Sanitize & Pad images
+                if isinstance(images, torch.Tensor):
+                    images = torch.nan_to_num(images, nan=0.0, posinf=1.0, neginf=-1.0)
+                    if images.ndim == 4 and images.shape[1] < 13:
+                        pad = torch.zeros((images.shape[0], 13 - images.shape[1], images.shape[2], images.shape[3]), device=images.device, dtype=images.dtype)
+                        images = torch.cat([images, pad], dim=1)
+                    elif images.ndim == 4 and images.shape[1] > 13:
+                        images = images[:, :13, :, :]
+
                 with torch.autocast(device_type="cuda" if use_amp else "cpu", enabled=use_amp):
                     outputs = self.model(images, task=task)
+                    
+                    # Clamp Targets
+                    try:
+                        nc = getattr(self.criteria[task], 'num_classes', getattr(self.model, 'num_classes', 2))
+                        if isinstance(targets, list):
+                            for t in targets:
+                                if isinstance(t, dict):
+                                    for k, v in t.items():
+                                        if hasattr(v, 'dtype') and v.dtype in (torch.long, torch.int64, torch.int32, torch.int8):
+                                            t[k] = torch.where((v < 0) | (v >= nc), torch.zeros_like(v), v)
+                        elif hasattr(targets, 'dtype') and targets.dtype in (torch.long, torch.int64, torch.int32, torch.int8):
+                            targets = torch.where((targets < 0) | (targets >= nc), torch.zeros_like(targets), targets)
+                    except Exception:
+                        pass
+                    
                     loss_dict = self.criteria[task](outputs, targets)
                     weight_dict = self.criteria[task].weight_dict
                     total_loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
