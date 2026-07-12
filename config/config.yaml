@@ -34,21 +34,28 @@ MODEL:
     activation: "gelu"
 
 # ------------------------------------------------------------------------------
-# 2. TRAINING HYPERPARAMETERS
+# 2. DATA CONFIGURATION
 # ------------------------------------------------------------------------------
-TRAIN:
+data:
+  batch_size: 4               
+  num_workers: 2              
+
+# ------------------------------------------------------------------------------
+# 3. TRAINING HYPERPARAMETERS
+# ------------------------------------------------------------------------------
+training:
   epochs: 50
   lr: 0.0001
   weight_decay: 0.05
   warmup_epochs: 5
   epoch_mode: "fixed_steps"
-  fixed_steps: 3
+  fixed_steps: 1000         
   patience: 15
   gradient_clip: 1.0
   amp: True
 
 # ------------------------------------------------------------------------------
-# 3. TASK-SPECIFIC CONFIGURATIONS
+# 4. TASK-SPECIFIC CONFIGURATIONS
 # ------------------------------------------------------------------------------
 TASKS:
   sen1floods11:
