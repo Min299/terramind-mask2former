@@ -51,8 +51,8 @@ TASK_PALETTES = {
 # ============================================================
 @dataclass
 class InferenceConfig:
-    model: str = "terramind_model"
-    task: str = "flood" # Change to 'burn' or 'landcover' to test others
+    model: str = "terramind_tiny"
+    task: str = "flood" 
     
     dataset_root: str = "/kaggle/working/data"
     output_dir: str = "/kaggle/working/outputs" 
@@ -78,10 +78,12 @@ class InferenceConfig:
             self.image_suffix, self.mask_suffix = "_S2Hand", "_LabelHand"
             self.num_classes = 2
         elif self.task == "burn":
-            # Adjust if your Kaggle zip unzips differently!
             base = root / "fire_scars" 
             if (base / "validation").exists(): base = base / "validation"
-            self.image_dir, self.mask_dir = str(base / "images"), str(base / "masks")
+            
+            # Robust fallback for images/masks folders
+            self.image_dir = str(base / "images") if (base / "images").exists() else str(base)
+            self.mask_dir = str(base / "masks") if (base / "masks").exists() else str(base)
             self.image_suffix, self.mask_suffix = "", ""
             self.num_classes = 2
         elif self.task == "landcover":
@@ -193,7 +195,7 @@ def inference(model, model_cfg, spec, loader, cfg, output_dir):
                 p2, p98 = np.percentile(rgb_img, (2, 98))
                 rgb_img = np.clip((rgb_img - p2) / (p98 - p2 + 1e-8), 0, 1)
 
-            save_path = output_dir / f"{Path(filenames[i]).stem}_{cfg.model}.png"
+            save_path = output_dir / f"{cfg.model}_{cfg.task}_{Path(filenames[i]).stem}.png"
             visualize_prediction(
                 image=rgb_img, prediction=pred_np, ground_truth=mask_np, metrics=metrics, 
                 palette=TASK_PALETTES[cfg.task]["palette"], class_names=TASK_PALETTES[cfg.task]["class_names"],
@@ -217,16 +219,21 @@ def inference(model, model_cfg, spec, loader, cfg, output_dir):
         print(f"[*] Report saved to: {csv_path}\n")
 
 # ============================================================
-# Main 
+# Main - TerraMind Benchmarking
 # ============================================================
 def main():
-    # You can add ("terramind_model", "burn") here to run them sequentially!
+    # Evaluate BOTH models across ALL 3 TASKS
     BENCHMARK_QUEUE = [
-        ("terramind_model", "flood"),
+        ("terramind_tiny", "flood"),
+        ("terramind_tiny", "burn"),
+        ("terramind_tiny", "landcover"),
+        ("terramind_base", "flood"),
+        ("terramind_base", "burn"),
+        ("terramind_base", "landcover"),
     ]
 
     print("=" * 70)
-    print("🚀 TerraMind Model Benchmark Suite (Kaggle)")
+    print("🚀 TerraMind Comprehensive Benchmark Suite (Kaggle)")
     print("=" * 70)
 
     out_dir = Path("/kaggle/working/outputs")
@@ -244,9 +251,7 @@ def main():
             loader = build_loader(cfg)
             inference(model, model_cfg, spec, loader, cfg, out_dir)
         except Exception as e:
-            print(f"[FAILED] Error running {model_name}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[FAILED] Error running {model_name} on {task_name}: {e}")
         finally:
             if 'model' in locals(): del model
             torch.cuda.empty_cache()
