@@ -82,13 +82,13 @@ MODEL_REGISTRY = {
     "terramind_tiny": {
         "loader": load_terramind, 
         "predict": predict_terramind,
-        "config": "", # Handled dynamically
-        "checkpoint": "/kaggle/input/terramind-mask2former-models/tiny_model.pth", 
+        "config": "", # (Handled dynamically)
+        "checkpoint": "/kaggle/input/datasets/mintumushahary/terramind-mask2former-models/tiny_model.pth", 
     },
     "terramind_base": {
         "loader": load_terramind, 
         "predict": predict_terramind,
-        "config": "", # Handled dynamically
-        "checkpoint": "/kaggle/input/terramind-mask2former-models/base_model.pth", 
+        "config": "", # (Handled dynamically)
+        "checkpoint": "/kaggle/input/datasets/mintumushahary/terramind-mask2former-models/base_model.pth", 
     }
 }
